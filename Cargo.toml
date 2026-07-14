@@ -1,0 +1,20 @@
+[package]
+name = "audio_analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# オーディオI/O。WindowsのWASAPIおよびASIOをサポート
+cpal = { version = "0.18.1", features = ["asio", "wasm-bindgen"] }
+
+# 高速フーリエ変換
+rustfft = "6.4.1"
+
+# ロックフリー・リングバッファ
+ringbuf = "0.5.0"
+
+# Immediate Mode GUIフレームワーク
+eframe = "0.30.0"
+
+# egui用のプロットライブラリ
+egui_plot = "0.30.0"
