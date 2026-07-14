@@ -1,49 +1,41 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{StreamConfig, BufferSize};
+use cpal::{BufferSize, FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, LineStyle};
 use ringbuf::{traits::{Consumer, Producer, Split}, HeapRb};
 use rustfft::{num_complex::Complex, FftPlanner};
-use std::sync::Arc;
 
 // --- 定数定義 ---
 const FFT_SIZE: usize = 2048;
 const RINGBUF_SIZE: usize = FFT_SIZE * 8; // 余裕を持たせたバッファサイズ
-const SAMPLE_RATE: u32 = 48000;
 
 /// アプリケーションのメイン状態
-/// Consumer トレイトを実装した型を汎用的に受け入れるようジェネリクス化
 struct AnalyzerApp<C: Consumer<Item = f32>> {
-    /// ロックフリーでオーディオI/Oスレッドからデータを受け取るコンシューマ
     audio_consumer: C,
-    /// 蓄積用バッファ
     sample_buffer: Vec<f32>,
-    /// 描画用の周波数特性データ (X: 周波数, Y: 振幅dB)
     magnitude_data: Vec<[f64; 2]>,
-    /// FFTプランナー
     planner: FftPlanner<f32>,
+    /// デバイスのネイティブサンプリングレートを動的に保持
+    actual_sample_rate: u32,
 }
 
 impl<C: Consumer<Item = f32>> AnalyzerApp<C> {
-    fn new(audio_consumer: C) -> Self {
+    fn new(audio_consumer: C, actual_sample_rate: u32) -> Self {
         Self {
             audio_consumer,
             sample_buffer: Vec::with_capacity(FFT_SIZE),
             magnitude_data: vec![[0.0; 2]; FFT_SIZE / 2],
             planner: FftPlanner::new(),
+            actual_sample_rate,
         }
     }
 
-    /// バッファからデータを読み出し、十分なサンプルがあればFFTを実行する
     fn process_dsp(&mut self) {
-        // ロックフリーで利用可能なサンプルを取り出す（ミューテックスの完全排除）
         while let Some(sample) = self.audio_consumer.try_pop() {
             self.sample_buffer.push(sample);
             
-            // バッファがFFTサイズに達したら処理を実行
             if self.sample_buffer.len() >= FFT_SIZE {
                 self.perform_fft();
-                // 処理後、バッファの半分を破棄（50%オーバーラップ処理）
                 self.sample_buffer.drain(0..(FFT_SIZE / 2));
             }
         }
@@ -52,7 +44,6 @@ impl<C: Consumer<Item = f32>> AnalyzerApp<C> {
     fn perform_fft(&mut self) {
         let fft = self.planner.plan_fft_forward(FFT_SIZE);
         
-        // ハニング窓の適用と複素数への変換
         let mut buffer: Vec<Complex<f32>> = self.sample_buffer
             .iter()
             .enumerate()
@@ -62,17 +53,16 @@ impl<C: Consumer<Item = f32>> AnalyzerApp<C> {
             })
             .collect();
 
-        // FFT実行 (In-place)
         fft.process(&mut buffer);
 
-        // 振幅のdB換算 (ナイキスト周波数まで)
-        let bin_resolution = SAMPLE_RATE as f64 / FFT_SIZE as f64;
+        // ネイティブサンプリングレートに基づく正確な周波数分解能の算出
+        let bin_resolution = self.actual_sample_rate as f64 / FFT_SIZE as f64;
         self.magnitude_data.clear();
 
         for i in 1..(FFT_SIZE / 2) {
             let freq = i as f64 * bin_resolution;
-            let norm = 2.0 / FFT_SIZE as f32; // 正規化
-            let mag = (buffer[i].norm() * norm).max(1e-6); // ゼロ除算・Log(0)回避
+            let norm = 2.0 / FFT_SIZE as f32;
+            let mag = (buffer[i].norm() * norm).max(1e-6);
             let db = 20.0 * mag.log10();
             
             self.magnitude_data.push([freq, db as f64]);
@@ -82,12 +72,10 @@ impl<C: Consumer<Item = f32>> AnalyzerApp<C> {
 
 impl<C: Consumer<Item = f32>> eframe::App for AnalyzerApp<C> {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. DSP処理の実行 (Consumerからのデータ吸い出しとFFT)
         self.process_dsp();
 
-        // 2. Immediate Mode GUIによる即時描画
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Acoustic Analyzer - Realtime Spectrum (Phase 3)");
+            ui.heading(format!("Acoustic Analyzer - Realtime Spectrum ({} Hz)", self.actual_sample_rate));
             ui.separator();
 
             let line = Line::new(PlotPoints::from_iter(self.magnitude_data.iter().copied()))
@@ -96,80 +84,78 @@ impl<C: Consumer<Item = f32>> eframe::App for AnalyzerApp<C> {
                 .name("Magnitude (dB)");
 
             Plot::new("magnitude_plot")
-                .x_axis_formatter(|val, _, _| format!("{:.0} Hz", val))
-                .y_axis_formatter(|val, _, _| format!("{:.1} dB", val))
-                .x_grid_spacer(egui_plot::log_grid_spacer(10)) // 対数スケール化
+                // egui_plot 0.30 仕様: 2引数 (GridMark, &RangeInclusive) を受け取る
+                .x_axis_formatter(|mark, _range| format!("{:.0} Hz", mark.value))
+                .y_axis_formatter(|mark, _range| format!("{:.1} dB", mark.value))
+                .x_grid_spacer(egui_plot::log_grid_spacer(10))
                 .view_aspect(2.0)
                 .show(ui, |plot_ui| {
                     plot_ui.line(line);
                 });
         });
 
-        // 60fps以上の応答性を保証するため、連続的な再描画を要求
         ctx.request_repaint();
     }
 }
 
 // --- オーディオI/O スレッドの初期化 ---
-// 戻り値を具象型ではなく、impl Trait による抽象型に変更し、バージョン間の差異を吸収
-fn setup_audio() -> impl Consumer<Item = f32> {
-    // Windows環境におけるOSミキサーのバイパスを意図し、可能であればWASAPIを指定。
-    // クロスプラットフォーム対応のため、デフォルトホストをフォールバックとして取得。
-    let host = cpal::host_from_id(cpal::HostId::Wasapi)
+// コンシューマに加えて、デバイスから取得したネイティブなサンプリングレートを返す
+fn setup_audio() -> (impl Consumer<Item = f32>, u32) {
+    // 1. プロフェッショナル要件の第一原理: OSミキサー完全バイパスのため、ASIOを最優先とする。
+    // ASIOが利用不可能な場合のみ、WASAPIへフォールバックする。
+    let host = cpal::host_from_id(cpal::HostId::Asio)
+        .or_else(|_| cpal::host_from_id(cpal::HostId::Wasapi))
         .unwrap_or_else(|_| cpal::default_host());
 
     let device = host.default_input_device().expect("マイク入力デバイスが見つかりません。");
-    println!("使用デバイス: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+    println!("オーディオデバイスを初期化しました。使用ホスト: {:?}", host.id());
 
     let config = device.default_input_config().expect("デバイスのデフォルト設定が取得できません。");
     let sample_format = config.sample_format();
     
-    // 強制的に要求仕様のサンプリングレートへオーバーライド
-    let stream_config = StreamConfig {
-        channels: 1, // Phase 3時点ではモノラル入力
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: BufferSize::Default,
-    };
+    // デバイスのネイティブ設定を完全尊重し、強制的なリサンプリングを回避する
+    let mut stream_config: StreamConfig = config.clone().into();
+    
+    // Windows環境 (WASAPI) における E_INVALIDARG (-2147024809) 回避策:
+    // BufferSize::Default をそのまま渡すと、一部のオーディオスタックがパニックを起こすため、
+    // ハードウェアがサポートするバッファサイズ範囲から具体的な値を明示的に指定する。
+    if host.id() == cpal::HostId::Wasapi {
+        if let cpal::SupportedBufferSize::Range { min, max } = config.buffer_size() {
+            // レイテンシと安定性のバランスを取り、最小値と最大値の安全な範囲を選択
+            let target_buffer_size = (*min).max(256).min(*max);
+            stream_config.buffer_size = BufferSize::Fixed(target_buffer_size);
+        }
+    }
 
-    // スレッド間通信用のロックフリー・リングバッファを生成
+    // cpal's StreamConfig.sample_rate may be a plain u32 in some versions,
+    // so handle it directly without field access.
+    let actual_sample_rate = stream_config.sample_rate;
+    let channels = stream_config.channels as usize;
+
     let rb = HeapRb::<f32>::new(RINGBUF_SIZE);
-    let (mut producer, consumer) = rb.split();
+    let (producer, consumer) = rb.split();
 
-    // DSP/オーディオスレッド構築（GCやヒープ割り当てを内部で一切行わない）
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            // エラーを解消するため、コンパイラの要求に従い参照ではなく値（clone/into）として渡す
-            device.build_input_stream(
-                stream_config.into(),
-                move |data: &[f32], _: &_| {
-                    // Lock-free data transmission
-                    producer.push_slice(data);
-                },
-                err_fn,
-                None,
-            )
-        },
-        _ => panic!("f32以外のサンプルフォーマットは現段階で未対応です。"),
-    }.expect("オーディオストリームの構築に失敗しました。");
+        SampleFormat::F32 => build_input_stream::<f32>(&device, stream_config.clone(), channels, producer),
+        SampleFormat::I16 => build_input_stream::<i16>(&device, stream_config.clone(), channels, producer),
+        SampleFormat::U16 => build_input_stream::<u16>(&device, stream_config.clone(), channels, producer),
+        _ => {
+            panic!("f32 / i16 / u16 以外のサンプルフォーマットは現段階で未対応です。");
+        }
+    }
+    .expect("オーディオストリームの構築に失敗しました。");
 
     stream.play().expect("オーディオストリームの再生開始に失敗しました。");
 
-    // メインスレッドが終了するまでオーディオストリームを維持するため、
-    // Box::leakを用いてライフタイムを'staticに引き上げる（アーキテクチャ上のハック）
     Box::leak(Box::new(stream));
 
-    consumer
-}
-
-fn err_fn(err: cpal::StreamError) {
-    eprintln!("オーディオ入力ストリームエラーが発生しました: {}", err);
+    (consumer, actual_sample_rate)
 }
 
 fn main() -> eframe::Result<()> {
-    // 1. オーディオI/Oを初期化し、Lock-free Queueのコンシューマを受け取る
-    let consumer = setup_audio();
+    // ネイティブサンプリングレートを取得し、アプリケーションへ伝搬
+    let (consumer, actual_sample_rate) = setup_audio();
 
-    // 2. GUIの初期設定 (Immediate Mode, Retained GUIの徹底排除)
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 600.0])
@@ -177,10 +163,38 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    // 3. アプリケーションの実行開始
     eframe::run_native(
         "Audio Analyzer",
         options,
-        Box::new(|_cc| Ok(Box::new(AnalyzerApp::new(consumer)))),
+        Box::new(move |_cc| Ok(Box::new(AnalyzerApp::new(consumer, actual_sample_rate)))),
     )
+}
+
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    stream_config: StreamConfig,
+    channels: usize,
+    mut producer: impl Producer<Item = f32> + Send + 'static,
+) -> Result<cpal::Stream, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: Sample + SizedSample + 'static,
+    f32: FromSample<T>,
+{
+    device
+        .build_input_stream(
+            stream_config,
+        move |data: &[T], _: &_| {
+            // マルチチャンネル環境でFFTの周波数軸が狂うのを防ぐため、Lチャンネル(1ch目)のみを抽出
+            for frame in data.chunks(channels) {
+                if let Some(&sample) = frame.first() {
+                    let sample_f32: f32 = sample.to_sample();
+                    let _ = producer.try_push(sample_f32);
+                }
+            }
+        },
+        // 型推論に委ねるクロージャとして定義し、cpalのバージョン間差異を吸収
+        |err| eprintln!("オーディオストリームエラー: {}", err),
+        None,
+    )
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }
