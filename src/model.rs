@@ -4,6 +4,7 @@ pub const AUDIO_BLOCK_FRAMES: usize = 256;
 pub const FFT_SIZE: usize = 2048;
 pub const HOP_SIZE: usize = FFT_SIZE / 2;
 pub const SPECTRUM_BINS: usize = FFT_SIZE / 2 + 1;
+pub const VECTOR_SCOPE_POINTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StereoFrame {
@@ -132,10 +133,17 @@ pub struct RuntimeStats {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinMetrics {
+    pub reference_dbfs: f32,
     pub measurement_dbfs: f32,
     pub transfer_db: f32,
     pub phase_degrees: f32,
     pub coherence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalLevel {
+    pub peak_dbfs: f32,
+    pub rms_dbfs: f32,
 }
 
 #[derive(Debug)]
@@ -144,6 +152,11 @@ pub struct AnalysisSnapshot {
     pub window_start_frame: u64,
     pub sample_rate: u32,
     pub has_reference: bool,
+    pub measurement_level: SignalLevel,
+    pub reference_level: Option<SignalLevel>,
+    pub phase_correlation: Option<f32>,
+    pub scope_points: [StereoFrame; VECTOR_SCOPE_POINTS],
+    pub scope_len: usize,
     pub bins: [BinMetrics; SPECTRUM_BINS],
 }
 
@@ -154,6 +167,11 @@ impl Default for AnalysisSnapshot {
             window_start_frame: 0,
             sample_rate: 0,
             has_reference: false,
+            measurement_level: SignalLevel::default(),
+            reference_level: None,
+            phase_correlation: None,
+            scope_points: [StereoFrame::default(); VECTOR_SCOPE_POINTS],
+            scope_len: 0,
             bins: [BinMetrics::default(); SPECTRUM_BINS],
         }
     }

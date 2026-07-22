@@ -3,7 +3,8 @@ use std::sync::Arc;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::model::{
-    AnalysisSnapshot, AudioBlock, BinMetrics, FFT_SIZE, HOP_SIZE, SPECTRUM_BINS, StereoFrame,
+    AnalysisSnapshot, AudioBlock, BinMetrics, FFT_SIZE, HOP_SIZE, SPECTRUM_BINS, SignalLevel,
+    StereoFrame, VECTOR_SCOPE_POINTS,
 };
 
 const AVERAGING_ALPHA: f32 = 0.2;
@@ -116,9 +117,25 @@ impl SpectrumAnalyzer {
             window_start_frame: self.window_start_frame,
             sample_rate: self.sample_rate,
             has_reference,
+            measurement_level: signal_level(self.samples.iter().map(|frame| frame.measurement)),
+            reference_level: has_reference
+                .then(|| signal_level(self.samples.iter().map(|frame| frame.reference))),
+            phase_correlation: has_reference.then(|| phase_correlation(&self.samples)),
             ..AnalysisSnapshot::default()
         };
         self.sequence = self.sequence.wrapping_add(1);
+
+        if has_reference {
+            let stride = FFT_SIZE / VECTOR_SCOPE_POINTS;
+            for (scope_index, sample_index) in (0..FFT_SIZE)
+                .step_by(stride)
+                .take(VECTOR_SCOPE_POINTS)
+                .enumerate()
+            {
+                snapshot.scope_points[scope_index] = self.samples[sample_index];
+                snapshot.scope_len += 1;
+            }
+        }
 
         for bin in 0..SPECTRUM_BINS {
             let reference = self.reference_fft[bin];
@@ -145,11 +162,14 @@ impl SpectrumAnalyzer {
             } else {
                 2.0
             };
+            let reference_amplitude =
+                reference.norm() * one_sided_factor / (FFT_SIZE as f32 * self.coherent_gain);
             let amplitude =
                 measurement.norm() * one_sided_factor / (FFT_SIZE as f32 * self.coherent_gain);
             let measurement_dbfs = amplitude_to_db(amplitude);
 
             let mut metrics = BinMetrics {
+                reference_dbfs: amplitude_to_db(reference_amplitude),
                 measurement_dbfs,
                 transfer_db: MIN_DB,
                 phase_degrees: 0.0,
@@ -184,6 +204,43 @@ fn blend_complex(previous: Complex<f32>, current: Complex<f32>) -> Complex<f32> 
 
 fn amplitude_to_db(amplitude: f32) -> f32 {
     20.0 * amplitude.max(10.0_f32.powf(MIN_DB / 20.0)).log10()
+}
+
+fn signal_level(samples: impl Iterator<Item = f32>) -> SignalLevel {
+    let mut peak = 0.0_f32;
+    let mut sum_squares = 0.0_f32;
+    let mut count = 0_usize;
+    for sample in samples {
+        peak = peak.max(sample.abs());
+        sum_squares += sample * sample;
+        count += 1;
+    }
+    let rms = if count == 0 {
+        0.0
+    } else {
+        (sum_squares / count as f32).sqrt()
+    };
+    SignalLevel {
+        peak_dbfs: amplitude_to_db(peak),
+        rms_dbfs: amplitude_to_db(rms),
+    }
+}
+
+fn phase_correlation(samples: &[StereoFrame]) -> f32 {
+    let mut cross = 0.0_f32;
+    let mut reference_power = 0.0_f32;
+    let mut measurement_power = 0.0_f32;
+    for frame in samples {
+        cross += frame.reference * frame.measurement;
+        reference_power += frame.reference * frame.reference;
+        measurement_power += frame.measurement * frame.measurement;
+    }
+    let denominator = (reference_power * measurement_power).sqrt();
+    if denominator <= POWER_EPSILON {
+        0.0
+    } else {
+        (cross / denominator).clamp(-1.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +283,9 @@ mod tests {
         };
         let snapshot = analyze_signals(sample_rate, tone, tone);
         assert!(snapshot.bins[bin].measurement_dbfs.abs() < 0.05);
+        assert!(snapshot.bins[bin].reference_dbfs.abs() < 0.05);
+        assert!(snapshot.measurement_level.peak_dbfs.abs() < 0.01);
+        assert!((snapshot.measurement_level.rms_dbfs + 3.0103).abs() < 0.01);
     }
 
     #[test]
@@ -264,5 +324,55 @@ mod tests {
         block.start_frame = (AUDIO_BLOCK_FRAMES * 2) as u64;
         assert!(analyzer.process_block(&block).is_none());
         assert_eq!(analyzer.samples.len(), AUDIO_BLOCK_FRAMES);
+    }
+
+    #[test]
+    fn correlation_reports_in_phase_opposite_and_quadrature_signals() {
+        let bin = 32;
+        let tone = |index: usize| {
+            (2.0 * std::f32::consts::PI * bin as f32 * index as f32 / FFT_SIZE as f32).sin()
+        };
+        let in_phase = analyze_signals(48_000, tone, tone);
+        let opposite = analyze_signals(48_000, tone, |index| -tone(index));
+        let quadrature = analyze_signals(48_000, tone, |index| {
+            (2.0 * std::f32::consts::PI * bin as f32 * index as f32 / FFT_SIZE as f32).cos()
+        });
+        assert!(in_phase.phase_correlation.unwrap() > 0.999);
+        assert!(opposite.phase_correlation.unwrap() < -0.999);
+        assert!(quadrature.phase_correlation.unwrap().abs() < 0.001);
+    }
+
+    #[test]
+    fn vector_scope_preserves_reference_measurement_pairs() {
+        let snapshot = analyze_signals(
+            48_000,
+            |index| index as f32 / FFT_SIZE as f32,
+            |index| -(index as f32) / FFT_SIZE as f32,
+        );
+        assert_eq!(snapshot.scope_len, VECTOR_SCOPE_POINTS);
+        let stride = FFT_SIZE / VECTOR_SCOPE_POINTS;
+        let point = snapshot.scope_points[42];
+        let expected = (42 * stride) as f32 / FFT_SIZE as f32;
+        assert!((point.reference - expected).abs() < f32::EPSILON);
+        assert!((point.measurement + expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mono_analysis_omits_reference_only_metrics() {
+        let mut analyzer = SpectrumAnalyzer::new(48_000);
+        let mut snapshot = None;
+        for block_index in 0..(FFT_SIZE / AUDIO_BLOCK_FRAMES) {
+            let block = AudioBlock {
+                start_frame: (block_index * AUDIO_BLOCK_FRAMES) as u64,
+                valid_frames: AUDIO_BLOCK_FRAMES,
+                has_reference: false,
+                ..AudioBlock::default()
+            };
+            snapshot = analyzer.process_block(&block).or(snapshot);
+        }
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.reference_level.is_none());
+        assert!(snapshot.phase_correlation.is_none());
+        assert_eq!(snapshot.scope_len, 0);
     }
 }
