@@ -260,7 +260,16 @@ impl BlockAssembler {
         self.block.valid_frames += 1;
         self.next_frame = self.next_frame.wrapping_add(1);
 
-        (self.block.valid_frames == AUDIO_BLOCK_FRAMES).then(|| mem::take(&mut self.block))
+        if self.block.valid_frames == AUDIO_BLOCK_FRAMES {
+            let replacement = AudioBlock {
+                route_generation: self.block.route_generation,
+                has_reference: self.block.has_reference,
+                ..AudioBlock::default()
+            };
+            Some(mem::replace(&mut self.block, replacement))
+        } else {
+            None
+        }
     }
 
     fn reuse(&mut self, mut block: AudioBlock) {
@@ -304,5 +313,28 @@ mod tests {
         assembler.push(StereoFrame::default());
         assembler.begin_callback(ChannelRoute::default_for_channels(2), 2);
         assert_eq!(assembler.block.valid_frames, 0);
+    }
+
+    #[test]
+    fn reference_state_is_preserved_across_multiple_blocks_in_one_callback() {
+        let mut assembler = BlockAssembler::default();
+        assembler.begin_callback(
+            ChannelRoute {
+                reference: Some(0),
+                measurement: 1,
+            },
+            4,
+        );
+
+        let mut completed = Vec::new();
+        for _ in 0..(AUDIO_BLOCK_FRAMES * 2) {
+            if let Some(block) = assembler.push(StereoFrame::default()) {
+                completed.push(block);
+            }
+        }
+
+        assert_eq!(completed.len(), 2);
+        assert!(completed.iter().all(|block| block.has_reference));
+        assert!(completed.iter().all(|block| block.route_generation == 4));
     }
 }
