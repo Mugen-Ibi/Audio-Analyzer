@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # オーディオI/O。WindowsのWASAPIおよびASIOをサポート
-cpal = { version = "0.18.1", features = ["asio", "wasm-bindgen"] }
+cpal = { version = "0.18.1", features = ["asio"] }
 
 # 高速フーリエ変換
 rustfft = "6.4.1"

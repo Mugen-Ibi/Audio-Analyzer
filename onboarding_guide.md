@@ -23,9 +23,9 @@
     
     リサンプリングによる音質劣化を防ぐため、デバイスのネイティブ・サンプリングレートを絶対的に尊重します。Windowsでは `cpal` の ASIOバックエンドを最優先とします。
     
-2. **Zero-Allocation in Hot Path (リアルタイム性の死守)**
+2. **Zero-Allocation in Audio Callback (リアルタイム性の死守)**
     
-    オーディオコールバックやDSP処理のループ内（Hot Path）での動的メモリ確保（`Vec::push`, `collect`, `String`の生成など）を**一切禁止**します。すべてのメモリは初期化時に事前確保（Pre-allocation）し、上書き再利用します。
+    オーディオコールバックでの動的メモリ確保、ロック、待機を禁止します。DSPの作業領域も初期化時に確保し、処理中に容量拡張しないよう再利用します。
     
 3. **Lock-Free Data Flow (スレッド間の非同期性)**
     
@@ -49,13 +49,13 @@
 
 ## 4. アーキテクチャの全体像 (3-Thread Model)
 
-現在はPhase 4の移行期にあり、最終的には以下の3スレッドモデルを構築します。
+現在は以下の3スレッドモデルで構築されています。
 
-1. **Audio I/O Thread**: ハードウェアからオーディオサンプルを取得し、Ring Bufferへ流し込む。（※現在実装済）
+1. **Audio I/O Thread**: 同一入力ストリームのReference/Measurementを同期ブロックとしてRing Bufferへ流し込む。
     
-2. **DSP Worker Thread**: Ring Bufferからサンプルを取り出し、FFTやLUFS計算を行う。（※**現在あなたが実装すべき最優先課題**）
+2. **DSP Worker Thread**: Ring Bufferからブロックを取り出し、同期FFT、伝達関数、位相、コヒーレンスを計算する。
     
-3. **UI / Render Thread**: DSPスレッドが計算した結果（Magnitude配列など）を受け取り、`egui` で60FPS描画を行う。
+3. **UI / Render Thread**: DSPスレッドが計算した最新結果を受け取り、`egui`で描画する。
     
 
 ## 5. 実装までのハードル・ゼロ設定ガイド (Setup Guide)
@@ -89,21 +89,11 @@ cargo build
 cargo run
 ```
 
-## 6. 現在の課題と、あなたの最初のタスク (Phase 4)
+## 6. 現在の課題
 
-あなたが最初に着手すべき具体的なタスクは、「重いFFT処理をUIスレッドから分離すること」です。
+1. 48/96/192kHzおよびASIO/WASAPI環境での実機性能試験。
+2. デバイス選択、FFTサイズ、平均方法、位相アンラップの設定UI。
+3. 同一デバイスの入出力ストリーム間における遅延推定。
+4. 別デバイス間のクロックドリフト検出と補正。
 
-**【現状の課題（`src/main.rs`）】**
-
-現在、`AnalyzerApp` の `update` メソッド（UIの描画ループ）の中で `process_dsp()` と `perform_fft()` が呼ばれています。また、`perform_fft` の中で毎フレーム `collect()` によるメモリアロケーションが発生しています。
-
-**【あなたのMission】**
-
-1. **DSPスレッドの分離**: `std::thread::spawn` 等を用いて専用のDSPワーカースレッドを作成し、UIの `update` とは非同期に `process_dsp()` をループ実行させるアーキテクチャにリファクタリングしてください。
-    
-2. **計算結果の受け渡し**: DSPスレッドで計算済みの `magnitude_data` を、UIスレッドへ安全に渡すための2つ目の Ring Buffer（または `crossbeam-channel` や `Arc<RwLock>` ※可能ならLock-freeを推奨）を実装してください。
-    
-3. **アロケーションの排除**: `perform_fft` 内の `collect()` を削除し、事前確保したスクラッチバッファ（使い回しの `Vec` または配列）の中身を上書きする処理に変更してください。
-    
-
-これらの修正が完了すれば、どんなにFFTサイズを大きくしてもUIがカクつかず、オーディオ処理も途切れない、真の「プロ仕様」の基盤が完成します。Happy Hacking!
+同期保証の対象は、同一デバイス・同一入力ストリーム内のチャンネルです。WASAPIは共有モードであり、Exclusive動作や別デバイス同期を前提にしてはいけません。
