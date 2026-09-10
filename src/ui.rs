@@ -16,7 +16,10 @@ use crate::{
 };
 
 use self::{
-    state::{AnalysisView, DisplayHold, HistoryBuffer, HistoryView, PeakHold},
+    state::{
+        AnalysisView, DEFAULT_NO_SIGNAL_THRESHOLD_DBFS, DisplayHold, HistoryBuffer, HistoryView,
+        HistoryViewport, PeakHold, SignalGate,
+    },
     theme::{
         BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_LOW, TEXT,
         TEXT_MUTED, YELLOW,
@@ -44,13 +47,15 @@ pub struct AnalyzerApp {
     reference_held_dbfs: f32,
     history: HistoryBuffer,
     history_view: HistoryView,
+    history_viewport: HistoryViewport,
     spectrogram_texture: Option<TextureHandle>,
     display_hold: DisplayHold,
     analysis_view: AnalysisView,
-    latest_sequence: Option<u64>,
-    latest_window_start: u64,
     has_reference: bool,
     last_snapshot_time: Option<f64>,
+    measurement_signal: SignalGate,
+    reference_signal: SignalGate,
+    no_signal_threshold_dbfs: f32,
     show_routing: bool,
     show_settings: bool,
     show_about: bool,
@@ -97,13 +102,15 @@ impl AnalyzerApp {
             reference_held_dbfs: -120.0,
             history: HistoryBuffer::default(),
             history_view: HistoryView::default(),
+            history_viewport: HistoryViewport::default(),
             spectrogram_texture: None,
             display_hold: DisplayHold::default(),
             analysis_view: AnalysisView::Spectrum,
-            latest_sequence: None,
-            latest_window_start: 0,
             has_reference: route.reference.is_some(),
             last_snapshot_time: None,
+            measurement_signal: SignalGate::default(),
+            reference_signal: SignalGate::default(),
+            no_signal_threshold_dbfs: DEFAULT_NO_SIGNAL_THRESHOLD_DBFS,
             show_routing: false,
             show_settings: false,
             show_about: false,
@@ -123,24 +130,47 @@ impl AnalyzerApp {
         discontinuities: u64,
     ) {
         self.last_snapshot_time = Some(now);
+        let measurement_was_active = self.measurement_signal.active();
+        let measurement_active = self.measurement_signal.update(
+            snapshot.measurement_level.rms_dbfs,
+            now,
+            self.no_signal_threshold_dbfs,
+        );
+        let reference_was_active = self.reference_signal.active();
+        let reference_active = snapshot.reference_level.is_some_and(|level| {
+            self.reference_signal
+                .update(level.rms_dbfs, now, self.no_signal_threshold_dbfs)
+        });
+        if measurement_was_active && !measurement_active {
+            self.measurement_peak_hold = PeakHold::default();
+            self.measurement_held_dbfs = -120.0;
+        }
+        if reference_was_active && !reference_active {
+            self.reference_peak_hold = PeakHold::default();
+            self.reference_held_dbfs = -120.0;
+        }
         if self.history.push(&snapshot, discontinuities) {
             let image = widgets::spectrogram_image(self.history.points(), 600);
             if let Some(texture) = &mut self.spectrogram_texture {
-                texture.set(image, TextureOptions::LINEAR);
+                texture.set(image, TextureOptions::NEAREST);
             } else {
                 self.spectrogram_texture =
-                    Some(ctx.load_texture("frequency_history", image, TextureOptions::LINEAR));
+                    Some(ctx.load_texture("frequency_history", image, TextureOptions::NEAREST));
             }
         }
         self.measurement_level = snapshot.measurement_level;
         self.reference_level = snapshot.reference_level;
         self.phase_correlation = snapshot.phase_correlation;
-        self.measurement_held_dbfs = self
-            .measurement_peak_hold
-            .update(snapshot.measurement_level.peak_dbfs, now);
-        self.reference_held_dbfs = snapshot.reference_level.map_or(-120.0, |level| {
-            self.reference_peak_hold.update(level.peak_dbfs, now)
-        });
+        if measurement_active {
+            self.measurement_held_dbfs = self
+                .measurement_peak_hold
+                .update(snapshot.measurement_level.peak_dbfs, now);
+        }
+        if reference_active {
+            self.reference_held_dbfs = snapshot.reference_level.map_or(-120.0, |level| {
+                self.reference_peak_hold.update(level.peak_dbfs, now)
+            });
+        }
         self.scope_points.clear();
         self.scope_points
             .extend_from_slice(&snapshot.scope_points[..snapshot.scope_len]);
@@ -173,9 +203,6 @@ impl AnalyzerApp {
                 }
             }
         }
-
-        self.latest_sequence = Some(snapshot.sequence);
-        self.latest_window_start = snapshot.window_start_frame;
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -499,36 +526,63 @@ impl AnalyzerApp {
             1
         };
         let card_width = (width - 12.0 * (columns - 1) as f32) / columns as f32;
+        let measurement_active = self.measurement_signal.active();
+        let reference_active = self.has_reference && self.reference_signal.active();
+        let sample_rate = self
+            .runtime
+            .info()
+            .map(|info| info.sample_rate as f32 / 1_000.0);
         let cards = [
             (
                 "MEASUREMENT RMS",
-                Some(self.measurement_level.rms_dbfs),
+                measurement_active.then_some(self.measurement_level.rms_dbfs),
                 "dBFS",
-                format!("Peak  {:.1} dBFS", self.measurement_level.peak_dbfs),
+                if measurement_active {
+                    format!("Peak  {:.1} dBFS", self.measurement_level.peak_dbfs)
+                } else {
+                    "NO SIGNAL".to_owned()
+                },
                 CYAN,
             ),
             (
                 "REFERENCE RMS",
-                self.reference_level.map(|level| level.rms_dbfs),
+                self.reference_level
+                    .filter(|_| reference_active)
+                    .map(|level| level.rms_dbfs),
                 "dBFS",
-                self.reference_level.map_or_else(
-                    || "Reference disabled".to_owned(),
-                    |level| format!("Peak  {:.1} dBFS", level.peak_dbfs),
-                ),
+                if !self.has_reference {
+                    "Reference disabled".to_owned()
+                } else if !reference_active {
+                    "NO SIGNAL".to_owned()
+                } else {
+                    format!(
+                        "Peak  {:.1} dBFS",
+                        self.reference_level.map_or(-120.0, |level| level.peak_dbfs)
+                    )
+                },
                 GREEN,
             ),
             (
                 "PHASE CORRELATION",
-                self.phase_correlation,
+                (measurement_active && reference_active)
+                    .then_some(self.phase_correlation)
+                    .flatten(),
                 "",
-                "Range  -1.0 / +1.0".to_owned(),
+                if measurement_active && reference_active {
+                    "Range  -1.0 / +1.0".to_owned()
+                } else {
+                    "NO SIGNAL".to_owned()
+                },
                 GREEN_BRIGHT,
             ),
             (
-                "ANALYSIS WINDOW",
-                self.latest_sequence.map(|sequence| sequence as f32),
-                "",
-                format!("Frame  {}", self.latest_window_start),
+                "INPUT SAMPLE RATE",
+                sample_rate,
+                "kHz",
+                self.runtime.info().map_or_else(
+                    || "Input disconnected".to_owned(),
+                    |info| format!("{} ch / FFT {FFT_SIZE}", info.channels),
+                ),
                 YELLOW,
             ),
         ];
@@ -549,6 +603,8 @@ impl AnalyzerApp {
     }
 
     fn peak_meters(&mut self, ui: &mut egui::Ui) {
+        let measurement_active = self.measurement_signal.active();
+        let reference_active = self.has_reference && self.reference_signal.active();
         widgets::module(
             ui,
             "PEAK_LEVEL_METERS / ピークメーター",
@@ -559,16 +615,30 @@ impl AnalyzerApp {
                 ui.horizontal_centered(|ui| {
                     widgets::level_meter(
                         ui,
-                        self.reference_level.map_or(-120.0, |level| level.peak_dbfs),
-                        self.reference_held_dbfs,
+                        self.reference_level
+                            .filter(|_| reference_active)
+                            .map_or(-120.0, |level| level.peak_dbfs),
+                        if reference_active {
+                            self.reference_held_dbfs
+                        } else {
+                            -120.0
+                        },
                         "基準",
                         GREEN,
                     );
                     ui.add_space(22.0);
                     widgets::level_meter(
                         ui,
-                        self.measurement_level.peak_dbfs,
-                        self.measurement_held_dbfs,
+                        if measurement_active {
+                            self.measurement_level.peak_dbfs
+                        } else {
+                            -120.0
+                        },
+                        if measurement_active {
+                            self.measurement_held_dbfs
+                        } else {
+                            -120.0
+                        },
                         "測定",
                         CYAN,
                     );
@@ -594,11 +664,19 @@ impl AnalyzerApp {
             208.0,
             |_| {},
             |ui| {
-                if self.has_reference {
+                if self.has_reference
+                    && self.measurement_signal.active()
+                    && self.reference_signal.active()
+                {
                     widgets::vectorscope(ui, &self.scope_points, self.phase_correlation);
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("N/A — 基準入力が無効です").color(TEXT_MUTED));
+                        let message = if self.has_reference {
+                            "N/A — 信号を検出していません"
+                        } else {
+                            "N/A — 基準入力が無効です"
+                        };
+                        ui.label(RichText::new(message).color(TEXT_MUTED));
                     });
                 }
             },
@@ -652,12 +730,20 @@ impl AnalyzerApp {
     }
 
     fn analysis_plot(&self, ui: &mut egui::Ui, height: f32) {
-        if !self.has_reference && self.analysis_view != AnalysisView::Spectrum {
+        let pair_active = self.has_reference
+            && self.measurement_signal.active()
+            && self.reference_signal.active();
+        if !pair_active && self.analysis_view != AnalysisView::Spectrum {
             ui.allocate_ui_with_layout(
                 vec2(ui.available_width(), height),
                 Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
-                    ui.label(RichText::new("N/A — 基準入力が無効です").color(TEXT_MUTED));
+                    let message = if self.has_reference {
+                        "N/A — 信号を検出していません"
+                    } else {
+                        "N/A — 基準入力が無効です"
+                    };
+                    ui.label(RichText::new(message).color(TEXT_MUTED));
                 },
             );
             return;
@@ -719,6 +805,12 @@ impl AnalyzerApp {
     fn history_module(&mut self, ui: &mut egui::Ui, height: f32, accent: bool) {
         let current_view = self.history_view;
         let mut selected_view = current_view;
+        let viewport = self.history_viewport;
+        let mut zoom_in = false;
+        let mut zoom_out = false;
+        let mut pan_older = false;
+        let mut pan_newer = false;
+        let mut jump_live = false;
         let points = self.history.points();
         let texture = self.spectrogram_texture.as_ref();
         let sample_rate = self.runtime.info().map_or(0, |info| info.sample_rate);
@@ -728,6 +820,19 @@ impl AnalyzerApp {
             accent,
             height,
             |ui| {
+                if current_view == HistoryView::Spectrum {
+                    jump_live =
+                        widgets::chip(ui, "現在へ", viewport.offset_from_live() == 0.0).clicked();
+                    pan_newer = widgets::chip(ui, "新しい →", false).clicked();
+                    pan_older = widgets::chip(ui, "← 過去", false).clicked();
+                    zoom_out = widgets::chip(ui, "縮小 −", false).clicked();
+                    zoom_in = widgets::chip(ui, "拡大 +", false).clicked();
+                    ui.label(
+                        RichText::new(format!("表示: {:.0}秒", viewport.visible_seconds()))
+                            .font(theme::bold(9.0))
+                            .color(CYAN),
+                    );
+                }
                 for view in HistoryView::ALL.into_iter().rev() {
                     if widgets::chip(ui, view.label(), view == current_view).clicked() {
                         selected_view = view;
@@ -742,11 +847,26 @@ impl AnalyzerApp {
             |ui| match current_view {
                 HistoryView::Level => widgets::history_plot(ui, points, height - 58.0),
                 HistoryView::Spectrum => {
-                    widgets::spectrogram(ui, texture, sample_rate, height - 58.0)
+                    widgets::spectrogram(ui, texture, sample_rate, viewport, height - 58.0)
                 }
             },
         );
         self.history_view = selected_view;
+        if zoom_in {
+            self.history_viewport.zoom_in();
+        }
+        if zoom_out {
+            self.history_viewport.zoom_out();
+        }
+        if pan_older {
+            self.history_viewport.pan_older();
+        }
+        if pan_newer {
+            self.history_viewport.pan_newer();
+        }
+        if jump_live {
+            self.history_viewport.jump_live();
+        }
     }
 
     fn routing_window(&mut self, ctx: &egui::Context) {
@@ -821,12 +941,47 @@ impl AnalyzerApp {
         egui::Window::new("表示設定 / DISPLAY SETTINGS")
             .open(&mut open)
             .resizable(false)
+            .default_width(390.0)
             .show(ctx, |ui| {
                 ui.checkbox(&mut self.show_top_cards, "信号カードを表示");
                 ui.checkbox(&mut self.show_timeline, "履歴パネルを表示");
                 ui.separator();
                 ui.label("FFT: 2048点 / 50%オーバーラップ");
                 ui.label("スペクトラム応答: 高速 / FAST");
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("高度な設定")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label("無信号閾値");
+                        let previous = self.no_signal_threshold_dbfs;
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.no_signal_threshold_dbfs,
+                                -120.0..=-40.0,
+                            )
+                            .suffix(" dBFS")
+                            .step_by(1.0),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "この値を下回る状態が続くと、数値・ピーク・相関表示を N/A に固定します。復帰には6 dBのヒステリシスがあります。",
+                            )
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                        if ui.button("既定値（-90 dBFS）に戻す").clicked() {
+                            self.no_signal_threshold_dbfs =
+                                DEFAULT_NO_SIGNAL_THRESHOLD_DBFS;
+                        }
+                        if self.no_signal_threshold_dbfs != previous {
+                            self.measurement_signal = SignalGate::default();
+                            self.reference_signal = SignalGate::default();
+                            self.measurement_peak_hold = PeakHold::default();
+                            self.reference_peak_hold = PeakHold::default();
+                            self.measurement_held_dbfs = -120.0;
+                            self.reference_held_dbfs = -120.0;
+                        }
+                    });
             });
         self.show_settings = open;
     }
@@ -836,6 +991,7 @@ impl AnalyzerApp {
         self.measurement_channel = route.measurement;
         self.route_error = None;
         self.history.clear();
+        self.history_viewport = HistoryViewport::default();
         self.spectrogram_texture = None;
         self.scope_points.clear();
         self.reference_points.clear();
@@ -850,9 +1006,9 @@ impl AnalyzerApp {
         self.reference_peak_hold = PeakHold::default();
         self.measurement_held_dbfs = -120.0;
         self.reference_held_dbfs = -120.0;
-        self.latest_sequence = None;
-        self.latest_window_start = 0;
         self.last_snapshot_time = None;
+        self.measurement_signal = SignalGate::default();
+        self.reference_signal = SignalGate::default();
         self.has_reference = route.reference.is_some();
         self.display_hold = DisplayHold::default();
     }
@@ -1094,9 +1250,11 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
             app.show_routing = true;
+            app.show_settings = true;
             app.history_view = HistoryView::Spectrum;
+            app.history_viewport.zoom_in();
             draw(&mut app);
-            assert!(app.latest_sequence.is_none());
+            assert!(!app.measurement_signal.active());
             assert_eq!(app.measurement_level.peak_dbfs, -120.0);
             assert!(app.history.points().is_empty());
         }

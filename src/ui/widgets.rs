@@ -8,7 +8,7 @@ use eframe::egui::{
 use crate::model::StereoFrame;
 
 use super::{
-    state::{HISTORY_SPECTRUM_BANDS, HistoryPoint},
+    state::{HISTORY_SECONDS, HISTORY_SPECTRUM_BANDS, HistoryPoint, HistoryViewport},
     theme::{
         self, BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_HIGH,
         SURFACE_LOW, TEXT, TEXT_MUTED, YELLOW,
@@ -320,14 +320,14 @@ pub fn spectrogram_image(points: &VecDeque<HistoryPoint>, width: usize) -> Color
     let Some(last) = points.back() else {
         return image;
     };
-    let start = last.seconds - 300.0;
+    let start = last.seconds - HISTORY_SECONDS;
     let mut levels = vec![-120.0_f32; width * HISTORY_SPECTRUM_BANDS];
     let mut gap_columns = vec![false; width];
     for point in points
         .iter()
         .filter(|point| point.gap && point.seconds >= start)
     {
-        let x = (((point.seconds - start) / 300.0) * width as f64)
+        let x = (((point.seconds - start) / HISTORY_SECONDS) * width as f64)
             .floor()
             .clamp(0.0, (width - 1) as f64) as usize;
         gap_columns[x] = true;
@@ -336,25 +336,33 @@ pub fn spectrogram_image(points: &VecDeque<HistoryPoint>, width: usize) -> Color
         if point.seconds < start {
             continue;
         }
-        let x = (((point.seconds - start) / 300.0) * width as f64)
+        let x = (((point.seconds - start) / HISTORY_SECONDS) * width as f64)
             .floor()
             .clamp(0.0, (width - 1) as f64) as usize;
-        if gap_columns[x] {
-            continue;
-        }
         for (band, dbfs) in point.spectrum_dbfs.iter().copied().enumerate() {
             let y = HISTORY_SPECTRUM_BANDS - 1 - band;
             let index = y * width + x;
             levels[index] = levels[index].max(dbfs);
         }
     }
-    for (pixel, level) in image.pixels.iter_mut().zip(levels) {
-        *pixel = spectrum_color(level);
+    for (index, (pixel, level)) in image.pixels.iter_mut().zip(levels).enumerate() {
+        let color = spectrum_color(level);
+        *pixel = if gap_columns[index % width] {
+            mix_color(color, RED, 0.42)
+        } else {
+            color
+        };
     }
     image
 }
 
-pub fn spectrogram(ui: &mut Ui, texture: Option<&TextureHandle>, sample_rate: u32, height: f32) {
+pub fn spectrogram(
+    ui: &mut Ui,
+    texture: Option<&TextureHandle>,
+    sample_rate: u32,
+    viewport: HistoryViewport,
+    height: f32,
+) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     response.on_hover_text("過去300秒の周波数分布。明るい色ほど信号レベルが高いことを示します。");
@@ -365,10 +373,11 @@ pub fn spectrogram(ui: &mut Ui, texture: Option<&TextureHandle>, sample_rate: u3
         pos2(rect.right() - 8.0, rect.bottom() - 20.0),
     );
     if let Some(texture) = texture {
+        let (uv_start, uv_end) = viewport.uv_bounds();
         ui.painter().image(
             texture.id(),
             graph,
-            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+            Rect::from_min_max(pos2(uv_start, 0.0), pos2(uv_end, 1.0)),
             Color32::WHITE,
         );
     } else {
@@ -397,7 +406,21 @@ pub fn spectrogram(ui: &mut Ui, texture: Option<&TextureHandle>, sample_rate: u3
             TEXT_MUTED,
         );
     }
-    for (fraction, label) in [(0.0, "-300秒"), (0.5, "-150秒"), (1.0, "現在")] {
+    let visible = viewport.visible_seconds();
+    let offset = viewport.offset_from_live();
+    let labels = [
+        (0.0, format_time_ago(offset + visible)),
+        (0.5, format_time_ago(offset + visible * 0.5)),
+        (
+            1.0,
+            if offset <= f64::EPSILON {
+                "現在".to_owned()
+            } else {
+                format_time_ago(offset)
+            },
+        ),
+    ];
+    for (fraction, label) in labels {
         let x = egui::lerp(graph.left()..=graph.right(), fraction);
         ui.painter().text(
             pos2(x, graph.bottom() + 5.0),
@@ -413,6 +436,34 @@ pub fn spectrogram(ui: &mut Ui, texture: Option<&TextureHandle>, sample_rate: u3
             TEXT_MUTED,
         );
     }
+
+    let legend = Rect::from_min_max(
+        pos2(graph.right() - 112.0, graph.top() + 6.0),
+        pos2(graph.right() - 8.0, graph.top() + 12.0),
+    );
+    for step in 0..52 {
+        let left = egui::lerp(legend.left()..=legend.right(), step as f32 / 52.0);
+        let right = egui::lerp(legend.left()..=legend.right(), (step + 1) as f32 / 52.0);
+        ui.painter().rect_filled(
+            Rect::from_min_max(pos2(left, legend.top()), pos2(right, legend.bottom())),
+            0.0,
+            spectrum_color(-110.0 + step as f32 / 51.0 * 110.0),
+        );
+    }
+    ui.painter().text(
+        pos2(legend.left(), legend.bottom() + 2.0),
+        Align2::LEFT_TOP,
+        "-110",
+        theme::mono(7.0),
+        TEXT_MUTED,
+    );
+    ui.painter().text(
+        pos2(legend.right(), legend.bottom() + 2.0),
+        Align2::RIGHT_TOP,
+        "0 dBFS",
+        theme::mono(7.0),
+        TEXT_MUTED,
+    );
 }
 
 fn history_frequency_ticks(nyquist: f64) -> Vec<f64> {
@@ -435,14 +486,18 @@ fn history_frequency_ticks(nyquist: f64) -> Vec<f64> {
 }
 
 fn spectrum_color(dbfs: f32) -> Color32 {
-    let amount = ((dbfs.clamp(-100.0, 0.0) + 100.0) / 100.0).powf(1.35);
-    if amount < 0.55 {
-        mix_color(BACKGROUND, Color32::from_rgb(0, 65, 72), amount / 0.55)
-    } else if amount < 0.82 {
-        mix_color(Color32::from_rgb(0, 65, 72), CYAN, (amount - 0.55) / 0.27)
+    let amount = ((dbfs.clamp(-110.0, 0.0) + 110.0) / 110.0).powf(0.8);
+    if amount < 0.45 {
+        mix_color(BACKGROUND, Color32::from_rgb(8, 54, 96), amount / 0.45)
+    } else if amount < 0.8 {
+        mix_color(Color32::from_rgb(8, 54, 96), CYAN, (amount - 0.45) / 0.35)
     } else {
-        mix_color(CYAN, GREEN_BRIGHT, (amount - 0.82) / 0.18)
+        mix_color(CYAN, GREEN_BRIGHT, (amount - 0.8) / 0.2)
     }
+}
+
+fn format_time_ago(seconds: f64) -> String {
+    format!("-{:.0}秒", seconds.max(0.0))
 }
 
 fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
@@ -476,7 +531,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spectrogram_aggregates_peaks_and_blanks_discontinuities() {
+    fn spectrogram_aggregates_peaks_and_marks_discontinuities() {
         let point = HistoryPoint {
             seconds: 1.0,
             measurement_rms: -6.0,
@@ -493,12 +548,9 @@ mod tests {
             gap: true,
             ..point
         });
-        assert!(
-            spectrogram_image(&points, 600)
-                .pixels
-                .iter()
-                .all(|pixel| *pixel == BACKGROUND)
-        );
+        let image = spectrogram_image(&points, 600);
+        assert!(image.pixels.iter().any(|pixel| *pixel != BACKGROUND));
+        assert!(image.pixels.iter().any(|pixel| pixel.r() > pixel.b()));
         assert!(spectrogram_image(&points, 0).pixels.is_empty());
     }
 
@@ -517,7 +569,7 @@ mod tests {
                         summary_metric(ui, "測定", None, "dBFS", "Peak N/A", CYAN);
                         level_meter(ui, -120.0, -120.0, "測定", CYAN);
                         history_plot(ui, &VecDeque::new(), 100.0);
-                        spectrogram(ui, None, 48_000, 100.0);
+                        spectrogram(ui, None, 48_000, HistoryViewport::default(), 100.0);
                         vectorscope(ui, &[], None);
                     });
                 },

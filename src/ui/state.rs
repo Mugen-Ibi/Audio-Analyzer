@@ -5,6 +5,104 @@ use crate::model::{AnalysisSnapshot, FFT_SIZE, SPECTRUM_BINS};
 const HISTORY_HZ: u64 = 10;
 const HISTORY_CAPACITY: usize = 3_000;
 pub const HISTORY_SPECTRUM_BANDS: usize = 96;
+pub const HISTORY_SECONDS: f64 = 300.0;
+pub const DEFAULT_NO_SIGNAL_THRESHOLD_DBFS: f32 = -90.0;
+
+const SIGNAL_HYSTERESIS_DB: f32 = 6.0;
+const SIGNAL_RELEASE_SECONDS: f64 = 0.5;
+const HISTORY_ZOOM_LEVELS: [f64; 5] = [300.0, 120.0, 60.0, 30.0, 10.0];
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignalGate {
+    active: bool,
+    below_since: Option<f64>,
+}
+
+impl SignalGate {
+    pub fn update(&mut self, rms_dbfs: f32, now: f64, threshold_dbfs: f32) -> bool {
+        if self.active {
+            if rms_dbfs < threshold_dbfs {
+                let below_since = self.below_since.get_or_insert(now);
+                if now - *below_since >= SIGNAL_RELEASE_SECONDS {
+                    self.active = false;
+                    self.below_since = None;
+                }
+            } else {
+                self.below_since = None;
+            }
+        } else if rms_dbfs >= threshold_dbfs + SIGNAL_HYSTERESIS_DB {
+            self.active = true;
+            self.below_since = None;
+        }
+        self.active
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryViewport {
+    zoom_index: usize,
+    offset_from_live: f64,
+}
+
+impl Default for HistoryViewport {
+    fn default() -> Self {
+        Self {
+            zoom_index: 0,
+            offset_from_live: 0.0,
+        }
+    }
+}
+
+impl HistoryViewport {
+    pub fn visible_seconds(self) -> f64 {
+        HISTORY_ZOOM_LEVELS[self.zoom_index]
+    }
+
+    pub fn offset_from_live(self) -> f64 {
+        self.offset_from_live
+    }
+
+    pub fn zoom_in(&mut self) {
+        if self.zoom_index + 1 < HISTORY_ZOOM_LEVELS.len() {
+            self.zoom_index += 1;
+            self.clamp_offset();
+        }
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.zoom_index = self.zoom_index.saturating_sub(1);
+        self.clamp_offset();
+    }
+
+    pub fn pan_older(&mut self) {
+        self.offset_from_live += self.visible_seconds() * 0.5;
+        self.clamp_offset();
+    }
+
+    pub fn pan_newer(&mut self) {
+        self.offset_from_live = (self.offset_from_live - self.visible_seconds() * 0.5).max(0.0);
+    }
+
+    pub fn jump_live(&mut self) {
+        self.offset_from_live = 0.0;
+    }
+
+    pub fn uv_bounds(self) -> (f32, f32) {
+        let end = 1.0 - self.offset_from_live / HISTORY_SECONDS;
+        let start = end - self.visible_seconds() / HISTORY_SECONDS;
+        (start.clamp(0.0, 1.0) as f32, end.clamp(0.0, 1.0) as f32)
+    }
+
+    fn clamp_offset(&mut self) {
+        self.offset_from_live = self
+            .offset_from_live
+            .clamp(0.0, HISTORY_SECONDS - self.visible_seconds());
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HistoryView {
@@ -294,5 +392,28 @@ mod tests {
         hold.toggle();
         assert!(hold.active());
         assert!(!hold.accepts_plot_update());
+    }
+
+    #[test]
+    fn signal_gate_uses_hysteresis_and_release_delay() {
+        let mut gate = SignalGate::default();
+        assert!(!gate.update(-90.0, 0.0, -90.0));
+        assert!(gate.update(-84.0, 0.1, -90.0));
+        assert!(gate.update(-100.0, 0.2, -90.0));
+        assert!(gate.update(-100.0, 0.69, -90.0));
+        assert!(!gate.update(-100.0, 0.71, -90.0));
+    }
+
+    #[test]
+    fn history_viewport_zooms_and_pans_within_fixed_window() {
+        let mut viewport = HistoryViewport::default();
+        assert_eq!(viewport.uv_bounds(), (0.0, 1.0));
+        viewport.zoom_in();
+        assert_eq!(viewport.visible_seconds(), 120.0);
+        assert_eq!(viewport.uv_bounds(), (0.6, 1.0));
+        viewport.pan_older();
+        assert_eq!(viewport.uv_bounds(), (0.4, 0.8));
+        viewport.jump_live();
+        assert_eq!(viewport.offset_from_live(), 0.0);
     }
 }
