@@ -17,7 +17,10 @@ use crate::{
 
 use self::{
     state::{AnalysisView, DisplayHold, HistoryBuffer, HistoryView, PeakHold},
-    theme::{BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, TEXT_MUTED},
+    theme::{
+        BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_LOW, TEXT,
+        TEXT_MUTED, YELLOW,
+    },
 };
 
 pub struct AnalyzerApp {
@@ -54,6 +57,7 @@ pub struct AnalyzerApp {
     show_top_cards: bool,
     show_timeline: bool,
     history_only: bool,
+    reset_scroll: bool,
     fullscreen: bool,
 }
 
@@ -106,6 +110,7 @@ impl AnalyzerApp {
             show_top_cards: true,
             show_timeline: true,
             history_only: false,
+            reset_scroll: true,
             fullscreen: false,
         }
     }
@@ -175,61 +180,87 @@ impl AnalyzerApp {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         TopBottomPanel::top("instrument_top_bar")
-            .exact_height(40.0)
+            .exact_height(68.0)
             .frame(
                 Frame::none()
-                    .fill(BACKGROUND)
+                    .fill(SURFACE)
                     .stroke(Stroke::new(1.0, OUTLINE)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("PRO AUDIO ANALYZER")
-                            .font(theme::bold(18.0))
-                            .color(GREEN_BRIGHT),
-                    );
-                    ui.add_space(22.0);
-                    ui.menu_button("ファイル", |ui| {
-                        if ui.button("終了").clicked() {
-                            ctx.send_viewport_cmd(ViewportCommand::Close);
-                        }
+                    ui.add_space(18.0);
+                    Frame::none()
+                        .fill(CYAN)
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("SA")
+                                    .font(theme::bold(15.0))
+                                    .color(BACKGROUND),
+                            );
+                        });
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("SPECTRA ANALYZER")
+                                .font(theme::bold(16.0))
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("REAL-TIME AUDIO WORKSPACE")
+                                .font(theme::mono(8.0))
+                                .color(TEXT_MUTED),
+                        );
                     });
-                    ui.menu_button("表示", |ui| {
-                        ui.checkbox(&mut self.show_top_cards, "信号カード");
-                        ui.checkbox(&mut self.show_timeline, "履歴パネル");
-                    });
-                    if ui.button("設定").clicked() {
-                        self.show_settings = true;
-                    }
-                    if ui.button("入力設定").clicked() {
-                        self.show_routing = true;
-                    }
-                    if ui.button("ヘルプ").clicked() {
-                        self.show_about = true;
-                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(8.0);
+                        ui.add_space(18.0);
                         if ui
-                            .button(RichText::new("PWR").color(GREEN).font(theme::bold(10.0)))
-                            .on_hover_text("Close application")
+                            .button(
+                                RichText::new("終了")
+                                    .color(TEXT_MUTED)
+                                    .font(theme::bold(10.0)),
+                            )
+                            .on_hover_text("アプリケーションを終了")
                             .clicked()
                         {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                         if ui
-                            .button(RichText::new("FULL").color(CYAN).font(theme::bold(10.0)))
+                            .button(
+                                RichText::new(if self.fullscreen {
+                                    "全画面を解除"
+                                } else {
+                                    "全画面"
+                                })
+                                .color(CYAN)
+                                .font(theme::bold(10.0)),
+                            )
                             .clicked()
                         {
                             self.fullscreen = !self.fullscreen;
                             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
                         }
-                        if ui
-                            .button(RichText::new("CFG").color(GREEN).font(theme::bold(10.0)))
-                            .clicked()
-                        {
-                            self.show_settings = true;
-                        }
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(if self.history_only {
+                                    "履歴"
+                                } else {
+                                    "概要"
+                                })
+                                .font(theme::bold(14.0))
+                                .color(TEXT),
+                            );
+                            ui.label(
+                                RichText::new(if self.history_only {
+                                    "過去300秒の信号を確認"
+                                } else {
+                                    "入力信号をリアルタイム解析"
+                                })
+                                .font(theme::mono(8.0))
+                                .color(TEXT_MUTED),
+                            );
+                        });
                     });
                 });
             });
@@ -237,7 +268,7 @@ impl AnalyzerApp {
 
     fn side_bar(&mut self, ctx: &egui::Context) {
         SidePanel::left("instrument_side_bar")
-            .exact_width(80.0)
+            .exact_width(188.0)
             .resizable(false)
             .frame(
                 Frame::none()
@@ -246,32 +277,48 @@ impl AnalyzerApp {
             )
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(12.0);
+                    ui.add_space(18.0);
                     ui.label(
-                        RichText::new("AUDIO_CORE")
-                            .font(theme::bold(8.0))
-                            .color(GREEN_BRIGHT),
+                        RichText::new("WORKSPACE")
+                            .font(theme::bold(9.0))
+                            .color(TEXT_MUTED),
                     );
-                    ui.add_space(16.0);
-                    if widgets::nav_item(ui, "I/O", "入力", false, true).clicked() {
+                    ui.add_space(10.0);
+                    if widgets::nav_item(ui, "01", "概要", !self.history_only, true).clicked() {
+                        self.history_only = false;
+                        self.reset_scroll = true;
+                    }
+                    if widgets::nav_item(ui, "02", "履歴", self.history_only, true).clicked() {
+                        self.history_only = true;
+                        self.reset_scroll = true;
+                    }
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new("SETUP")
+                            .font(theme::bold(9.0))
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(10.0);
+                    if widgets::nav_item(ui, "IN", "入力ルーティング", false, true).clicked()
+                    {
                         self.show_routing = true;
                     }
-                    let _ = widgets::nav_item(ui, "--", "出力", false, false);
-                    let _ = widgets::nav_item(ui, "EQ", "フィルタ", false, false);
-                    if widgets::nav_item(ui, "~", "解析", !self.history_only, true).clicked() {
-                        self.history_only = false;
+                    if widgets::nav_item(ui, "UI", "表示設定", false, true).clicked() {
+                        self.show_settings = true;
                     }
-                    if widgets::nav_item(ui, "H", "履歴", self.history_only, true).clicked() {
-                        self.history_only = true;
+                    if widgets::nav_item(ui, "?", "このアプリについて", false, true).clicked()
+                    {
+                        self.show_about = true;
                     }
-                    let _ = widgets::nav_item(ui, "EX", "書出", false, false);
                 });
             });
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
         TopBottomPanel::bottom("instrument_status_bar")
-            .exact_height(24.0)
+            .exact_height(32.0)
             .frame(
                 Frame::none()
                     .fill(BACKGROUND)
@@ -279,7 +326,7 @@ impl AnalyzerApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(8.0);
+                    ui.add_space(14.0);
                     let stats = self.runtime.stats();
                     let stream_errors = stats.stream_errors.load(Ordering::Relaxed);
                     let dropped_audio = stats.dropped_audio_frames.load(Ordering::Relaxed);
@@ -293,20 +340,29 @@ impl AnalyzerApp {
                             RED
                         },
                         if stream_errors != 0 {
-                            "● ストリーム異常"
+                            "● STREAM ERROR"
                         } else if receiving {
-                            "● システム正常"
+                            "● LIVE"
                         } else {
-                            "● 入力待機 / 停止"
+                            "● IDLE"
                         },
                     );
-                    ui.label(format!("AUDIO_DROPS: {dropped_audio}"));
-                    ui.label(format!(
-                        "DISPLAY_DROPS: {}",
-                        stats.dropped_results.load(Ordering::Relaxed)
-                    ));
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("Audio drops  {dropped_audio}"))
+                            .font(theme::mono(9.0))
+                            .color(TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Display drops  {}",
+                            stats.dropped_results.load(Ordering::Relaxed)
+                        ))
+                        .font(theme::mono(9.0))
+                        .color(TEXT_MUTED),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(8.0);
+                        ui.add_space(14.0);
                         if let Some(info) = self.runtime.info() {
                             ui.colored_label(
                                 CYAN,
@@ -326,144 +382,170 @@ impl AnalyzerApp {
             .frame(
                 Frame::none()
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(8.0)),
+                    .inner_margin(egui::Margin::same(18.0)),
             )
             .show(ctx, |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.history_only {
-                            self.history_module(ui, ui.available_height().max(500.0), true);
-                            return;
-                        }
+                let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
+                if self.reset_scroll {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                    self.reset_scroll = false;
+                }
+                scroll.show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        vec2(ui.available_width(), 46.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(if self.history_only {
+                                        "信号履歴"
+                                    } else {
+                                        "解析ダッシュボード"
+                                    })
+                                    .font(theme::bold(21.0))
+                                    .color(TEXT),
+                                );
+                                ui.label(
+                                    RichText::new(if self.history_only {
+                                        "レベルと周波数分布を最大300秒さかのぼって確認できます。"
+                                    } else {
+                                        "測定入力と基準入力の状態をひとつの画面で監視します。"
+                                    })
+                                    .font(theme::mono(10.0))
+                                    .color(TEXT_MUTED),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let receiving = self
+                                    .last_snapshot_time
+                                    .is_some_and(|last| ctx.input(|input| input.time) - last < 1.0);
+                                let (label, color) = if receiving {
+                                    ("● REAL-TIME", GREEN)
+                                } else {
+                                    ("● STANDBY", TEXT_MUTED)
+                                };
+                                ui.label(RichText::new(label).font(theme::bold(10.0)).color(color));
+                            });
+                        },
+                    );
+                    ui.add_space(18.0);
 
-                        if self.show_top_cards {
-                            self.top_cards(ui);
-                            ui.add_space(8.0);
-                        }
-                        let timeline_space = if self.show_timeline { 180.0 } else { 0.0 };
-                        let plot_height = (ui.available_height() - timeline_space - 8.0).max(310.0);
-                        self.analysis_module(ui, plot_height);
-                        if self.show_timeline {
-                            ui.add_space(8.0);
-                            self.history_module(ui, 170.0, false);
-                        }
-                    });
+                    if self.history_only {
+                        self.history_module(ui, ui.available_height().max(520.0), true);
+                        return;
+                    }
+
+                    if self.show_top_cards {
+                        self.top_cards(ui);
+                        ui.add_space(14.0);
+                    }
+
+                    let content_height = 472.0;
+                    if ui.available_width() >= 980.0 {
+                        let analysis_width = (ui.available_width() - 318.0).max(560.0);
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(
+                                vec2(analysis_width, content_height),
+                                Layout::top_down(Align::Min),
+                                |ui| self.analysis_module(ui, content_height),
+                            );
+                            ui.vertical(|ui| {
+                                ui.set_width(304.0);
+                                ui.allocate_ui_with_layout(
+                                    vec2(304.0, 226.0),
+                                    Layout::top_down(Align::Min),
+                                    |ui| self.peak_meters(ui),
+                                );
+                                ui.add_space(12.0);
+                                ui.allocate_ui_with_layout(
+                                    vec2(304.0, 234.0),
+                                    Layout::top_down(Align::Min),
+                                    |ui| self.phase_scope(ui),
+                                );
+                            });
+                        });
+                    } else {
+                        self.analysis_module(ui, 420.0);
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            let card_width = (ui.available_width() - 12.0) / 2.0;
+                            ui.allocate_ui_with_layout(
+                                vec2(card_width, 226.0),
+                                Layout::top_down(Align::Min),
+                                |ui| self.peak_meters(ui),
+                            );
+                            ui.allocate_ui_with_layout(
+                                vec2(card_width, 226.0),
+                                Layout::top_down(Align::Min),
+                                |ui| self.phase_scope(ui),
+                            );
+                        });
+                    }
+                    if self.show_timeline {
+                        ui.add_space(14.0);
+                        self.history_module(ui, 190.0, false);
+                    }
+                });
             });
     }
 
     fn top_cards(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
-        if width >= 1050.0 {
-            let card_width = (width - 16.0) / 3.0;
-            ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    vec2(card_width, 210.0),
-                    Layout::top_down(Align::Min),
-                    |ui| self.signal_metrics(ui),
-                );
-                ui.allocate_ui_with_layout(
-                    vec2(card_width, 210.0),
-                    Layout::top_down(Align::Min),
-                    |ui| self.peak_meters(ui),
-                );
-                ui.allocate_ui_with_layout(
-                    vec2(card_width, 210.0),
-                    Layout::top_down(Align::Min),
-                    |ui| self.phase_scope(ui),
-                );
-            });
-        } else if width >= 700.0 {
-            let card_width = (width - 8.0) / 2.0;
-            ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    vec2(card_width, 210.0),
-                    Layout::top_down(Align::Min),
-                    |ui| self.signal_metrics(ui),
-                );
-                ui.allocate_ui_with_layout(
-                    vec2(card_width, 210.0),
-                    Layout::top_down(Align::Min),
-                    |ui| self.peak_meters(ui),
-                );
-            });
-            ui.add_space(8.0);
-            ui.allocate_ui_with_layout(vec2(width, 210.0), Layout::top_down(Align::Min), |ui| {
-                self.phase_scope(ui)
-            });
+        let columns = if width >= 920.0 {
+            4
+        } else if width >= 520.0 {
+            2
         } else {
-            ui.allocate_ui_with_layout(vec2(width, 210.0), Layout::top_down(Align::Min), |ui| {
-                self.signal_metrics(ui)
+            1
+        };
+        let card_width = (width - 12.0 * (columns - 1) as f32) / columns as f32;
+        let cards = [
+            (
+                "MEASUREMENT RMS",
+                Some(self.measurement_level.rms_dbfs),
+                "dBFS",
+                format!("Peak  {:.1} dBFS", self.measurement_level.peak_dbfs),
+                CYAN,
+            ),
+            (
+                "REFERENCE RMS",
+                self.reference_level.map(|level| level.rms_dbfs),
+                "dBFS",
+                self.reference_level.map_or_else(
+                    || "Reference disabled".to_owned(),
+                    |level| format!("Peak  {:.1} dBFS", level.peak_dbfs),
+                ),
+                GREEN,
+            ),
+            (
+                "PHASE CORRELATION",
+                self.phase_correlation,
+                "",
+                "Range  -1.0 / +1.0".to_owned(),
+                GREEN_BRIGHT,
+            ),
+            (
+                "ANALYSIS WINDOW",
+                self.latest_sequence.map(|sequence| sequence as f32),
+                "",
+                format!("Frame  {}", self.latest_window_start),
+                YELLOW,
+            ),
+        ];
+        for row in cards.chunks(columns) {
+            ui.horizontal(|ui| {
+                for (label, value, unit, detail, color) in row {
+                    ui.allocate_ui_with_layout(
+                        vec2(card_width, 112.0),
+                        Layout::top_down(Align::Min),
+                        |ui| widgets::summary_metric(ui, label, *value, unit, detail, *color),
+                    );
+                }
             });
-            ui.add_space(8.0);
-            ui.allocate_ui_with_layout(vec2(width, 210.0), Layout::top_down(Align::Min), |ui| {
-                self.peak_meters(ui)
-            });
-            ui.add_space(8.0);
-            ui.allocate_ui_with_layout(vec2(width, 210.0), Layout::top_down(Align::Min), |ui| {
-                self.phase_scope(ui)
-            });
+            if columns < 4 {
+                ui.add_space(10.0);
+            }
         }
-    }
-
-    fn signal_metrics(&mut self, ui: &mut egui::Ui) {
-        widgets::module(
-            ui,
-            "SIGNAL_METRICS / 信号レベル",
-            false,
-            208.0,
-            |_| {},
-            |ui| {
-                ui.columns(3, |columns| {
-                    widgets::metric(
-                        &mut columns[0],
-                        "測定 RMS",
-                        Some(self.measurement_level.rms_dbfs),
-                        "dBFS",
-                        CYAN,
-                    );
-                    widgets::metric(
-                        &mut columns[1],
-                        "基準 RMS",
-                        self.reference_level.map(|level| level.rms_dbfs),
-                        "dBFS",
-                        GREEN,
-                    );
-                    widgets::metric(
-                        &mut columns[2],
-                        "相関",
-                        self.phase_correlation,
-                        "-1 / +1",
-                        GREEN_BRIGHT,
-                    );
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("測定 PEAK")
-                            .font(theme::bold(8.0))
-                            .color(TEXT_MUTED),
-                    );
-                    ui.colored_label(
-                        CYAN,
-                        format!("{:.1} dBFS", self.measurement_level.peak_dbfs),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new("基準 PEAK")
-                            .font(theme::bold(8.0))
-                            .color(TEXT_MUTED),
-                    );
-                    ui.colored_label(
-                        GREEN,
-                        self.reference_level.map_or_else(
-                            || "N/A".to_owned(),
-                            |level| format!("{:.1} dBFS", level.peak_dbfs),
-                        ),
-                    );
-                });
-            },
-        );
     }
 
     fn peak_meters(&mut self, ui: &mut egui::Ui) {
@@ -790,48 +872,82 @@ impl AnalyzerApp {
     }
 
     fn connection_bar(&mut self, ctx: &egui::Context) {
-        TopBottomPanel::top("input_connection").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                match self.runtime.state() {
-                    ConnectionState::Stopped => {
-                        ui.label("入力未接続");
-                    }
-                    ConnectionState::Starting => {
+        let state = self.runtime.state().clone();
+        let can_start = matches!(
+            &state,
+            ConnectionState::Stopped | ConnectionState::Failed(_)
+        );
+        let can_stop = matches!(&state, ConnectionState::Starting | ConnectionState::Running);
+        TopBottomPanel::top("input_connection")
+            .exact_height(52.0)
+            .frame(
+                Frame::none()
+                    .fill(SURFACE_LOW)
+                    .stroke(Stroke::new(1.0, OUTLINE)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(14.0);
+                    let (label, color) = match &state {
+                        ConnectionState::Stopped => ("入力は停止しています".to_owned(), TEXT_MUTED),
+                        ConnectionState::Starting => ("入力デバイスに接続中…".to_owned(), YELLOW),
+                        ConnectionState::Running => ("入力接続済み".to_owned(), GREEN),
+                        ConnectionState::Stopping => ("入力を停止中…".to_owned(), YELLOW),
+                        ConnectionState::Failed(error) => (format!("接続失敗 — {error}"), RED),
+                    };
+                    if matches!(
+                        &state,
+                        ConnectionState::Starting | ConnectionState::Stopping
+                    ) {
                         ui.spinner();
-                        ui.label("入力デバイスに接続中…");
+                    } else {
+                        ui.colored_label(color, "●");
                     }
-                    ConnectionState::Running => {
-                        ui.colored_label(GREEN, "入力接続済み");
-                    }
-                    ConnectionState::Stopping => {
-                        ui.spinner();
-                        ui.label("入力を停止中…");
-                    }
-                    ConnectionState::Failed(error) => {
-                        ui.colored_label(RED, format!("入力接続に失敗: {error}"));
-                    }
-                }
-                if matches!(
-                    self.runtime.state(),
-                    ConnectionState::Stopped | ConnectionState::Failed(_)
-                ) && ui.button("接続 / 再試行").clicked()
-                    && let Err(error) = self.runtime.start()
-                {
-                    self.route_error = Some(error);
-                }
-                if matches!(
-                    self.runtime.state(),
-                    ConnectionState::Starting | ConnectionState::Running
-                ) && ui.button("停止").clicked()
-                {
-                    self.runtime.stop();
-                    self.reset_display(ChannelRoute::default_for_channels(1));
-                }
-                if let Some(error) = &self.route_error {
-                    ui.colored_label(RED, error);
-                }
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(label).font(theme::bold(10.0)).color(color));
+                        if let Some(info) = self.runtime.info() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  ·  {} Hz  ·  {} channels",
+                                    info.device_name, info.sample_rate, info.channels
+                                ))
+                                .font(theme::mono(8.0))
+                                .color(TEXT_MUTED),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("オーディオ入力を接続すると解析を開始します")
+                                    .font(theme::mono(8.0))
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        if can_start
+                            && ui
+                                .add(
+                                    egui::Button::new("接続 / 再試行")
+                                        .fill(CYAN)
+                                        .stroke(Stroke::NONE),
+                                )
+                                .clicked()
+                            && let Err(error) = self.runtime.start()
+                        {
+                            self.route_error = Some(error);
+                        }
+                        if can_stop && ui.button("入力を停止").clicked() {
+                            self.runtime.stop();
+                            self.reset_display(ChannelRoute::default_for_channels(1));
+                        }
+                        if matches!(&state, ConnectionState::Running)
+                            && ui.button("ルーティング").clicked()
+                        {
+                            self.show_routing = true;
+                        }
+                    });
+                });
             });
-        });
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -903,6 +1019,12 @@ fn frequency_grid_marks(nyquist: f64) -> Vec<GridMark> {
     .into_iter()
     .filter(|frequency| *frequency <= nyquist)
     .collect();
+    if frequencies
+        .last()
+        .is_some_and(|last| nyquist / last < 1.35 && (last - nyquist).abs() > nyquist * 0.001)
+    {
+        frequencies.pop();
+    }
     if frequencies
         .last()
         .is_none_or(|last| (last - nyquist).abs() > nyquist * 0.001)

@@ -47,6 +47,16 @@ Rust Edition 2024を使用します。WindowsでASIOを有効にしているた�
 cargo run --release
 ```
 
+`asio-sys` は初回ビルド時にSteinberg ASIO SDKを `%TEMP%\asio_sdk` へキャッシュします。以前の取得が中断されるなどして空のキャッシュだけが残ると、`asiodrivers.h: No such file or directory` でビルドが失敗します。次の確認が `False` の場合はキャッシュを退避してから再実行してください。SDKは次回ビルド時に公式配布元から再取得されます。
+
+```powershell
+Test-Path "$env:TEMP\asio_sdk\host\asiodrivers.h"
+Rename-Item "$env:TEMP\asio_sdk" "asio_sdk.invalid"
+cargo build --release --locked
+```
+
+`asio_sdk.invalid` がすでに存在する場合は、別の退避名を指定してください。LLVMを標準以外の場所へインストールした場合は、あわせて `LIBCLANG_PATH` をLLVMの `bin` ディレクトリへ設定します。
+
 ASIO SDKを利用しないWindows GUI（WASAPI）:
 
 ```powershell

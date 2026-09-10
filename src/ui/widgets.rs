@@ -10,8 +10,8 @@ use crate::model::StereoFrame;
 use super::{
     state::{HISTORY_SPECTRUM_BANDS, HistoryPoint},
     theme::{
-        self, BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_HIGH, TEXT,
-        TEXT_MUTED, YELLOW,
+        self, BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_HIGH,
+        SURFACE_LOW, TEXT, TEXT_MUTED, YELLOW,
     },
 };
 
@@ -23,29 +23,36 @@ pub fn module(
     controls: impl FnOnce(&mut Ui),
     body: impl FnOnce(&mut Ui),
 ) {
-    let stroke = Stroke::new(1.0, if accent { GREEN } else { OUTLINE });
+    let stroke = Stroke::new(1.0, if accent { CYAN } else { OUTLINE });
     Frame::none()
         .fill(SURFACE)
         .stroke(stroke)
+        .rounding(12.0)
         .inner_margin(egui::Margin::same(0.0))
         .show(ui, |ui| {
             ui.set_min_height(min_height);
             Frame::none()
-                .fill(BACKGROUND)
-                .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                .fill(SURFACE_LOW)
+                .rounding(egui::Rounding {
+                    nw: 12.0,
+                    ne: 12.0,
+                    sw: 0.0,
+                    se: 0.0,
+                })
+                .inner_margin(egui::Margin::symmetric(16.0, 11.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(title)
-                                .font(theme::bold(10.0))
-                                .color(if accent { GREEN_BRIGHT } else { TEXT_MUTED }),
+                                .font(theme::bold(11.0))
+                                .color(if accent { TEXT } else { TEXT_MUTED }),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), controls);
                     });
                 });
             ui.separator();
             Frame::none()
-                .inner_margin(egui::Margin::same(12.0))
+                .inner_margin(egui::Margin::same(16.0))
                 .show(ui, body);
         });
 }
@@ -53,70 +60,70 @@ pub fn module(
 pub fn chip(ui: &mut Ui, label: &str, active: bool) -> Response {
     let text = RichText::new(label)
         .font(theme::bold(9.0))
-        .color(if active { CYAN } else { TEXT_MUTED });
+        .color(if active { TEXT } else { TEXT_MUTED });
     let button = egui::Button::new(text)
         .fill(if active {
-            Color32::from_rgba_unmultiplied(0, 219, 233, 25)
+            Color32::from_rgba_unmultiplied(91, 168, 255, 38)
         } else {
             BACKGROUND
         })
         .stroke(Stroke::new(1.0, if active { CYAN } else { OUTLINE }))
-        .rounding(0.0);
+        .rounding(7.0);
     ui.add(button)
 }
 
-pub fn metric(ui: &mut Ui, label: &str, value: Option<f32>, unit: &str, color: Color32) {
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new(label)
-                .font(theme::bold(9.0))
-                .color(TEXT_MUTED),
-        );
-        let value = value.map_or_else(|| "N/A".to_owned(), |value| format!("{value:.1}"));
-        ui.label(RichText::new(value).font(theme::mono(32.0)).color(color));
-        ui.label(RichText::new(unit).font(theme::bold(8.0)).color(TEXT_MUTED));
-    });
+pub fn summary_metric(
+    ui: &mut Ui,
+    label: &str,
+    value: Option<f32>,
+    unit: &str,
+    detail: &str,
+    color: Color32,
+) {
+    Frame::none()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, OUTLINE))
+        .rounding(12.0)
+        .inner_margin(egui::Margin::same(16.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_min_height(78.0);
+            ui.label(
+                RichText::new(label)
+                    .font(theme::bold(9.0))
+                    .color(TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                let value = value.map_or_else(|| "N/A".to_owned(), |value| format!("{value:.1}"));
+                ui.label(RichText::new(value).font(theme::mono(25.0)).color(color));
+                ui.label(RichText::new(unit).font(theme::bold(8.0)).color(TEXT_MUTED));
+            });
+            ui.label(
+                RichText::new(detail)
+                    .font(theme::mono(8.0))
+                    .color(TEXT_MUTED),
+            );
+        });
 }
 
 pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, selected: bool, enabled: bool) -> Response {
-    let desired = vec2(ui.available_width(), 58.0);
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
-    let response = if enabled {
-        response
+    let color = if selected { CYAN } else { TEXT_MUTED };
+    let button = egui::Button::new(
+        RichText::new(format!("{glyph}   {label}"))
+            .font(theme::bold(11.0))
+            .color(color),
+    )
+    .fill(if selected {
+        Color32::from_rgba_unmultiplied(91, 168, 255, 38)
     } else {
-        response.on_disabled_hover_text("今後のリリースで対応予定です")
-    };
-    if selected {
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 219, 233, 18));
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, vec2(2.0, rect.height())),
-            0.0,
-            CYAN,
-        );
-    }
-    let color = if !enabled {
-        TEXT_MUTED.gamma_multiply(0.35)
-    } else if selected {
-        CYAN
-    } else {
-        TEXT_MUTED
-    };
-    ui.painter().text(
-        pos2(rect.center().x, rect.top() + 20.0),
-        Align2::CENTER_CENTER,
-        glyph,
-        theme::bold(17.0),
-        color,
-    );
-    ui.painter().text(
-        pos2(rect.center().x, rect.bottom() - 12.0),
-        Align2::CENTER_CENTER,
-        label,
-        theme::bold(8.0),
-        color,
-    );
-    response
+        Color32::TRANSPARENT
+    })
+    .stroke(Stroke::NONE)
+    .rounding(7.0);
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.add_sized(vec2(ui.available_width() - 16.0, 44.0), button)
+    })
+    .inner
 }
 
 pub fn level_meter(ui: &mut Ui, current_dbfs: f32, held_dbfs: f32, label: &str, color: Color32) {
@@ -507,7 +514,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        metric(ui, "測定", None, "dBFS", CYAN);
+                        summary_metric(ui, "測定", None, "dBFS", "Peak N/A", CYAN);
                         level_meter(ui, -120.0, -120.0, "測定", CYAN);
                         history_plot(ui, &VecDeque::new(), 100.0);
                         spectrogram(ui, None, 48_000, 100.0);
