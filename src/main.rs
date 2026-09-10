@@ -1,8 +1,10 @@
-use audio_analyzer::{pipeline::AnalyzerRuntime, ui::AnalyzerApp};
+use audio_analyzer::{audio::CpalSource, controller::AnalyzerController, ui::AnalyzerApp};
 use eframe::egui;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = AnalyzerRuntime::start().map_err(std::io::Error::other)?;
+    let mut controller =
+        AnalyzerController::with_source(CpalSource).map_err(std::io::Error::other)?;
+    controller.start().map_err(std::io::Error::other)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -14,7 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Pro Audio Analyzer",
         options,
-        Box::new(move |creation_context| Ok(Box::new(AnalyzerApp::new(runtime, creation_context)))),
+        Box::new(move |creation_context| {
+            Ok(Box::new(AnalyzerApp::new(controller, creation_context)))
+        }),
     )?;
     Ok(())
 }

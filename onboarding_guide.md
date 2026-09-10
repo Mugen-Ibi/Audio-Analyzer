@@ -13,7 +13,7 @@
 - DAW内部のミキサーやパンロウ（Pan Law）設定による「入力信号の意図せぬ変質」。
     
 
-本プロジェクトは、「OSのオーディオミキサーを完全にバイパスし、ハードウェアからの入力信号をビットパーフェクトに監視する完全独立型の解析プラットフォーム」を構築することを目的としています。Rustの「メモリ安全性」と「データ競合のない並行処理（Fearless Concurrency）」を武器に、C++の既存製品を凌駕する次世代のオーディオツールを目指しています。
+本プロジェクトは、DAWから独立して同一入力ストリームの信号を解析するツールです。WindowsではASIOを優先し、利用できなければ共有モードのWASAPIに切り替えます。OSミキサーの完全なバイパスやビットパーフェクト入力は保証しません。
 
 ## 2. 設計の美学（Core Aesthetics）
 
@@ -47,16 +47,22 @@
 - **Plotting:** `egui_plot`
     
 
-## 4. アーキテクチャの全体像 (3-Thread Model)
+## 4. アーキテクチャと変更の入口
 
-現在は以下の3スレッドモデルで構築されています。
+設計案の比較と要件との対応は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
-1. **Audio I/O Thread**: 同一入力ストリームのReference/Measurementを同期ブロックとしてRing Bufferへ流し込む。
-    
-2. **DSP Worker Thread**: Ring Bufferからブロックを取り出し、同期FFT、伝達関数、位相、コヒーレンスを計算する。
-    
-3. **UI / Render Thread**: DSPスレッドが計算した最新結果を受け取り、`egui`で描画する。
-    
+1. **Audio callback**: `capture::CaptureWriter` が同一ストリームの入力ペアを固定長ブロックとしてSPSCへ渡します。CPAL固有の処理は `audio` に限定します。
+2. **DSP worker**: `SpectrumAnalyzer` を実行し、最新の結果をSPSCへ渡します。解析コアはデバイスやUIを知りません。
+3. **UI thread**: `AnalyzerController` の接続状態と結果を描画します。UIの更新中にドライバーの起動・停止・joinを行いません。
+4. **Control thread**: `InputSource` から入力を開き、`AnalyzerRuntime` を所有します。入力ストリームはこのスレッドに留まり、結果の受信端だけをUIへ移します。
+
+信号処理の変更は `dsp`、入力追加は `source::InputSource` / `InputStream`、接続状態の変更は `controller`、描画の変更は `ui` が入口です。新しい入力は `capture::channel` でコールバック側と解析側を作り、`OpenedSource::new` で検証済みの接続として返します。
+
+`tests/session_lifecycle.rs` は合成入力アダプターの例と、失敗・キャンセル・再接続の結合試験です。`tests/realtime_contract.rs` はコールバックとFFT処理の初期化後のメモリ確保を計測します。
+
+まず `cargo test --locked --no-default-features` でコアを検証できます。WindowsでASIO SDKがない場合も `cargo run --no-default-features --features desktop` でWASAPIのGUIを起動できます。
+
+音声データ経路は従来どおりロックフリーです。開始要求の容量1の制御チャネルはリアルタイム経路の外側に置きます。停止時は入力を止めてからDSPをjoinし、アプリ終了時は制御スレッドもjoinします。
 
 ## 5. 実装までのハードル・ゼロ設定ガイド (Setup Guide)
 
@@ -89,7 +95,7 @@ cargo build
 cargo run
 ```
 
-## 6. 現在の課題
+## 6. 今後の機能拡張・実機検証
 
 1. 48/96/192kHzおよびASIO/WASAPI環境での実機性能試験。
 2. デバイス選択、FFTサイズ、平均方法、位相アンラップの設定UI。

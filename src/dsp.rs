@@ -19,6 +19,7 @@ pub struct SpectrumAnalyzer {
     samples: Vec<StereoFrame>,
     reference_fft: Vec<Complex<f32>>,
     measurement_fft: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
     averaged_reference_power: Vec<f32>,
     averaged_measurement_power: Vec<f32>,
     averaged_cross_power: Vec<Complex<f32>>,
@@ -40,9 +41,11 @@ impl SpectrumAnalyzer {
             })
             .collect();
         let coherent_gain = window.iter().sum::<f32>() / FFT_SIZE as f32;
+        let fft_scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
 
         Self {
             sample_rate,
+            fft_scratch,
             fft,
             window,
             coherent_gain,
@@ -80,7 +83,10 @@ impl SpectrumAnalyzer {
             if self.samples.is_empty() {
                 self.window_start_frame = block.start_frame + offset as u64;
             }
-            self.samples.push(*frame);
+            self.samples.push(StereoFrame {
+                reference: finite_sample(frame.reference),
+                measurement: finite_sample(frame.measurement),
+            });
 
             if self.samples.len() == FFT_SIZE {
                 newest = Some(self.analyze(block.has_reference));
@@ -109,10 +115,13 @@ impl SpectrumAnalyzer {
             self.measurement_fft[index] = Complex::new(frame.measurement * window, 0.0);
         }
 
-        self.fft.process(&mut self.reference_fft);
-        self.fft.process(&mut self.measurement_fft);
+        self.fft
+            .process_with_scratch(&mut self.reference_fft, &mut self.fft_scratch);
+        self.fft
+            .process_with_scratch(&mut self.measurement_fft, &mut self.fft_scratch);
 
         let mut snapshot = AnalysisSnapshot {
+            route_generation: self.route_generation.unwrap_or(0),
             sequence: self.sequence,
             window_start_frame: self.window_start_frame,
             sample_rate: self.sample_rate,
@@ -126,13 +135,20 @@ impl SpectrumAnalyzer {
         self.sequence = self.sequence.wrapping_add(1);
 
         if has_reference {
-            let stride = FFT_SIZE / VECTOR_SCOPE_POINTS;
-            for (scope_index, sample_index) in (0..FFT_SIZE)
-                .step_by(stride)
-                .take(VECTOR_SCOPE_POINTS)
+            // Preserve a representative pair per bucket. Fixed-stride sampling
+            // aliases tones whose period divides the stride to a single point.
+            for (scope_index, bucket) in self
+                .samples
+                .chunks(FFT_SIZE / VECTOR_SCOPE_POINTS)
                 .enumerate()
             {
-                snapshot.scope_points[scope_index] = self.samples[sample_index];
+                snapshot.scope_points[scope_index] = *bucket
+                    .iter()
+                    .max_by(|a, b| {
+                        (a.reference.abs().max(a.measurement.abs()))
+                            .total_cmp(&b.reference.abs().max(b.measurement.abs()))
+                    })
+                    .expect("scope buckets are nonempty");
                 snapshot.scope_len += 1;
             }
         }
@@ -194,6 +210,10 @@ impl SpectrumAnalyzer {
     }
 }
 
+fn finite_sample(sample: f32) -> f32 {
+    if sample.is_finite() { sample } else { 0.0 }
+}
+
 fn blend(previous: f32, current: f32) -> f32 {
     previous + AVERAGING_ALPHA * (current - previous)
 }
@@ -247,6 +267,71 @@ fn phase_correlation(samples: &[StereoFrame]) -> f32 {
 mod tests {
     use super::*;
     use crate::model::{AUDIO_BLOCK_FRAMES, AudioBlock, StereoFrame};
+
+    #[test]
+    fn non_finite_samples_do_not_poison_fft_or_averages() {
+        let snapshot = analyze_signals(
+            48_000,
+            |i| if i == 10 { f32::NAN } else { 0.5 },
+            |i| if i == 20 { f32::INFINITY } else { 0.25 },
+        );
+        for bin in snapshot.bins {
+            assert!(bin.measurement_dbfs.is_finite());
+            assert!(bin.transfer_db.is_finite());
+            assert!(bin.phase_degrees.is_finite());
+            assert!(bin.coherence.is_finite());
+        }
+        assert!(snapshot.measurement_level.rms_dbfs.is_finite());
+        assert!(snapshot.phase_correlation.unwrap().is_finite());
+    }
+
+    #[test]
+    fn route_change_resets_overlap_and_averaged_transfer() {
+        let mut analyzer = SpectrumAnalyzer::new(48_000);
+        let mut latest = None;
+        for index in 0..24 {
+            let generation = u64::from(index >= 12);
+            let block = AudioBlock {
+                start_frame: index * AUDIO_BLOCK_FRAMES as u64,
+                valid_frames: AUDIO_BLOCK_FRAMES,
+                route_generation: generation,
+                has_reference: true,
+                frames: [StereoFrame {
+                    reference: 0.5,
+                    measurement: if generation == 0 { 0.5 } else { 0.25 },
+                }; AUDIO_BLOCK_FRAMES],
+            };
+            if let Some(snapshot) = analyzer.process_block(&block) {
+                if generation == 1 {
+                    assert!(snapshot.window_start_frame >= 12 * AUDIO_BLOCK_FRAMES as u64);
+                    assert!((snapshot.bins[0].transfer_db + 6.0206).abs() < 0.01);
+                }
+                latest = Some(snapshot);
+            }
+        }
+        assert_eq!(latest.unwrap().route_generation, 1);
+    }
+
+    #[test]
+    fn supported_rates_and_overlap_keep_correct_frame_positions() {
+        for rate in [48_000, 96_000, 192_000] {
+            let mut analyzer = SpectrumAnalyzer::new(rate);
+            let mut starts = Vec::new();
+            for index in 0..16 {
+                let block = AudioBlock {
+                    start_frame: index * AUDIO_BLOCK_FRAMES as u64,
+                    valid_frames: AUDIO_BLOCK_FRAMES,
+                    ..AudioBlock::default()
+                };
+                if let Some(snapshot) = analyzer.process_block(&block) {
+                    assert_eq!(snapshot.sample_rate, rate);
+                    assert_eq!(snapshot.measurement_level.rms_dbfs, -120.0);
+                    starts.push(snapshot.window_start_frame);
+                }
+            }
+            assert_eq!(starts, vec![0, HOP_SIZE as u64, FFT_SIZE as u64]);
+        }
+    }
 
     fn analyze_signals(
         sample_rate: u32,
@@ -352,9 +437,21 @@ mod tests {
         assert_eq!(snapshot.scope_len, VECTOR_SCOPE_POINTS);
         let stride = FFT_SIZE / VECTOR_SCOPE_POINTS;
         let point = snapshot.scope_points[42];
-        let expected = (42 * stride) as f32 / FFT_SIZE as f32;
+        let expected = (42 * stride + stride - 1) as f32 / FFT_SIZE as f32;
         assert!((point.reference - expected).abs() < f32::EPSILON);
         assert!((point.measurement + expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vector_scope_does_not_alias_a_period_sixteen_tone_to_silence() {
+        let tone = |index: usize| (2.0 * std::f32::consts::PI * index as f32 / 16.0).sin();
+        let snapshot = analyze_signals(48_000, tone, tone);
+        assert!(
+            snapshot
+                .scope_points
+                .iter()
+                .all(|point| point.measurement.abs() > 0.99)
+        );
     }
 
     #[test]

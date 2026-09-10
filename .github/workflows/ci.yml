@@ -5,6 +5,18 @@ on:
   pull_request:
 
 jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --release --locked --no-default-features
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
   rust:
     runs-on: windows-latest
     env:
@@ -16,4 +28,6 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo test --locked
+      - run: cargo test --locked --no-default-features --features desktop
+      - run: cargo test --release --locked
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings

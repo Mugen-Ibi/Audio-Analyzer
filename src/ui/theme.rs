@@ -21,6 +21,13 @@ const BOLD_FAMILY: &str = "JetBrains Mono Bold";
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    let japanese_font = [
+        r"C:\Windows\Fonts\BIZ-UDGothicR.ttc",
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read(path).ok());
     fonts.font_data.insert(
         "jetbrains-regular".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
@@ -33,17 +40,29 @@ pub fn install(ctx: &egui::Context) {
             "../../assets/fonts/JetBrainsMono-Bold.ttf"
         ))),
     );
+    if let Some(font) = japanese_font {
+        fonts.font_data.insert(
+            "japanese-system".to_owned(),
+            Arc::new(FontData::from_owned(font)),
+        );
+    }
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts
+        let family_fonts = fonts
             .families
             .get_mut(&family)
-            .expect("default font family must exist")
-            .insert(0, "jetbrains-regular".to_owned());
+            .expect("default font family must exist");
+        if fonts.font_data.contains_key("japanese-system") {
+            family_fonts.insert(0, "japanese-system".to_owned());
+        }
+        family_fonts.insert(0, "jetbrains-regular".to_owned());
     }
-    fonts.families.insert(
-        FontFamily::Name(BOLD_FAMILY.into()),
-        vec!["jetbrains-bold".to_owned()],
-    );
+    let mut bold_fonts = vec!["jetbrains-bold".to_owned()];
+    if fonts.font_data.contains_key("japanese-system") {
+        bold_fonts.push("japanese-system".to_owned());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_fonts);
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.style()).clone();

@@ -3,9 +3,24 @@ name = "audio_analyzer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["desktop", "asio"]
+audio-device = ["dep:cpal"]
+asio = ["audio-device", "cpal/asio"]
+desktop = ["audio-device", "dep:eframe", "dep:egui_plot"]
+
+[[bin]]
+name = "audio_analyzer"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "live_audio"
+required-features = ["audio-device"]
+
 [dependencies]
 # オーディオI/O。WindowsのWASAPIおよびASIOをサポート
-cpal = { version = "0.18.1", features = ["asio"] }
+cpal = { version = "0.18.1", optional = true }
 
 # 高速フーリエ変換
 rustfft = "6.4.1"
@@ -14,7 +29,7 @@ rustfft = "6.4.1"
 ringbuf = "0.5.0"
 
 # Immediate Mode GUIフレームワーク
-eframe = "0.30.0"
+eframe = { version = "0.30.0", optional = true }
 
 # egui用のプロットライブラリ
-egui_plot = "0.30.0"
+egui_plot = { version = "0.30.0", optional = true }

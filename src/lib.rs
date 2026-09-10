@@ -1,5 +1,10 @@
+#[cfg(feature = "audio-device")]
 pub mod audio;
+pub mod capture;
+pub mod controller;
 pub mod dsp;
 pub mod model;
 pub mod pipeline;
+pub mod source;
+#[cfg(feature = "desktop")]
 pub mod ui;

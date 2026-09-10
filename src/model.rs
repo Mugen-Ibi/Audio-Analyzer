@@ -61,6 +61,9 @@ impl ChannelRoute {
     }
 
     pub fn validate(self, channels: usize) -> Result<Self, String> {
+        if channels == 0 || channels > u16::MAX as usize {
+            return Err("input must have 1..=65535 channels".to_owned());
+        }
         if self.measurement >= channels {
             return Err(format!(
                 "Measurement channel {} is outside the {} available channels",
@@ -116,7 +119,7 @@ fn unpack_route(packed: u64) -> (ChannelRoute, u64) {
     let generation = packed >> 32;
     (
         ChannelRoute {
-            reference: (encoded_reference != 0).then_some(encoded_reference - 1),
+            reference: encoded_reference.checked_sub(1),
             measurement,
         },
         generation,
@@ -125,6 +128,7 @@ fn unpack_route(packed: u64) -> (ChannelRoute, u64) {
 
 #[derive(Default)]
 pub struct RuntimeStats {
+    pub received_audio_frames: AtomicU64,
     pub dropped_audio_frames: AtomicU64,
     pub stream_errors: AtomicU64,
     pub discontinuities: AtomicU64,
@@ -140,14 +144,24 @@ pub struct BinMetrics {
     pub coherence: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SignalLevel {
     pub peak_dbfs: f32,
     pub rms_dbfs: f32,
 }
 
+impl Default for SignalLevel {
+    fn default() -> Self {
+        Self {
+            peak_dbfs: -120.0,
+            rms_dbfs: -120.0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AnalysisSnapshot {
+    pub route_generation: u64,
     pub sequence: u64,
     pub window_start_frame: u64,
     pub sample_rate: u32,
@@ -163,6 +177,7 @@ pub struct AnalysisSnapshot {
 impl Default for AnalysisSnapshot {
     fn default() -> Self {
         Self {
+            route_generation: 0,
             sequence: 0,
             window_start_frame: 0,
             sample_rate: 0,
@@ -180,6 +195,15 @@ impl Default for AnalysisSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_reference_round_trips() {
+        let route = ChannelRoute::default_for_channels(1);
+        let control = RouteControl::new(route);
+        assert_eq!(control.load(), (route, 0));
+        control.store(route);
+        assert_eq!(control.load(), (route, 1));
+    }
 
     #[test]
     fn route_control_publishes_a_complete_route() {

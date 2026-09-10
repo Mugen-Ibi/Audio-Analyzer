@@ -6,22 +6,23 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 use eframe::egui::{
     self, Align, CentralPanel, Frame, Layout, RichText, ScrollArea, SidePanel, Stroke,
-    TopBottomPanel, ViewportCommand, vec2,
+    TextureHandle, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
 };
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints};
 
 use crate::{
+    controller::{AnalyzerController, ConnectionState},
     model::{AnalysisSnapshot, ChannelRoute, FFT_SIZE, SignalLevel, StereoFrame},
-    pipeline::AnalyzerRuntime,
 };
 
 use self::{
-    state::{AnalysisView, DisplayHold, HistoryBuffer, PeakHold},
+    state::{AnalysisView, DisplayHold, HistoryBuffer, HistoryView, PeakHold},
     theme::{BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, TEXT_MUTED},
 };
 
 pub struct AnalyzerApp {
-    runtime: AnalyzerRuntime,
+    runtime: AnalyzerController,
+    display_connection: ConnectionState,
     reference_channel: Option<usize>,
     measurement_channel: usize,
     route_error: Option<String>,
@@ -39,11 +40,14 @@ pub struct AnalyzerApp {
     measurement_held_dbfs: f32,
     reference_held_dbfs: f32,
     history: HistoryBuffer,
+    history_view: HistoryView,
+    spectrogram_texture: Option<TextureHandle>,
     display_hold: DisplayHold,
     analysis_view: AnalysisView,
     latest_sequence: Option<u64>,
     latest_window_start: u64,
     has_reference: bool,
+    last_snapshot_time: Option<f64>,
     show_routing: bool,
     show_settings: bool,
     show_about: bool,
@@ -54,11 +58,23 @@ pub struct AnalyzerApp {
 }
 
 impl AnalyzerApp {
-    pub fn new(runtime: AnalyzerRuntime, creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        runtime: AnalyzerController,
+        creation_context: &eframe::CreationContext<'_>,
+    ) -> Self {
         theme::install(&creation_context.egui_ctx);
-        let route = runtime.info().initial_route;
+        Self::with_controller(runtime)
+    }
+
+    fn with_controller(runtime: AnalyzerController) -> Self {
+        let route = runtime
+            .info()
+            .map_or(ChannelRoute::default_for_channels(1), |info| {
+                info.initial_route
+            });
         Self {
             runtime,
+            display_connection: ConnectionState::Stopped,
             reference_channel: route.reference,
             measurement_channel: route.measurement,
             route_error: None,
@@ -76,11 +92,14 @@ impl AnalyzerApp {
             measurement_held_dbfs: -120.0,
             reference_held_dbfs: -120.0,
             history: HistoryBuffer::default(),
+            history_view: HistoryView::default(),
+            spectrogram_texture: None,
             display_hold: DisplayHold::default(),
             analysis_view: AnalysisView::Spectrum,
             latest_sequence: None,
             latest_window_start: 0,
             has_reference: route.reference.is_some(),
+            last_snapshot_time: None,
             show_routing: false,
             show_settings: false,
             show_about: false,
@@ -91,8 +110,23 @@ impl AnalyzerApp {
         }
     }
 
-    fn update_snapshot(&mut self, snapshot: AnalysisSnapshot, now: f64, discontinuities: u64) {
-        self.history.push(&snapshot, discontinuities);
+    fn update_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: AnalysisSnapshot,
+        now: f64,
+        discontinuities: u64,
+    ) {
+        self.last_snapshot_time = Some(now);
+        if self.history.push(&snapshot, discontinuities) {
+            let image = widgets::spectrogram_image(self.history.points(), 600);
+            if let Some(texture) = &mut self.spectrogram_texture {
+                texture.set(image, TextureOptions::LINEAR);
+            } else {
+                self.spectrogram_texture =
+                    Some(ctx.load_texture("frequency_history", image, TextureOptions::LINEAR));
+            }
+        }
         self.measurement_level = snapshot.measurement_level;
         self.reference_level = snapshot.reference_level;
         self.phase_correlation = snapshot.phase_correlation;
@@ -107,6 +141,7 @@ impl AnalyzerApp {
             .extend_from_slice(&snapshot.scope_points[..snapshot.scope_len]);
 
         if self.display_hold.accepts_plot_update() {
+            self.has_reference = snapshot.has_reference;
             self.reference_points.clear();
             self.measurement_points.clear();
             self.transfer_points.clear();
@@ -136,7 +171,6 @@ impl AnalyzerApp {
 
         self.latest_sequence = Some(snapshot.sequence);
         self.latest_window_start = snapshot.window_start_frame;
-        self.has_reference = snapshot.has_reference;
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -156,22 +190,22 @@ impl AnalyzerApp {
                             .color(GREEN_BRIGHT),
                     );
                     ui.add_space(22.0);
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Exit").clicked() {
+                    ui.menu_button("ファイル", |ui| {
+                        if ui.button("終了").clicked() {
                             ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                     });
-                    ui.menu_button("View", |ui| {
-                        ui.checkbox(&mut self.show_top_cards, "Signal cards");
-                        ui.checkbox(&mut self.show_timeline, "Timeline history");
+                    ui.menu_button("表示", |ui| {
+                        ui.checkbox(&mut self.show_top_cards, "信号カード");
+                        ui.checkbox(&mut self.show_timeline, "履歴パネル");
                     });
-                    if ui.button("Settings").clicked() {
+                    if ui.button("設定").clicked() {
                         self.show_settings = true;
                     }
-                    if ui.button("Routing").clicked() {
+                    if ui.button("入力設定").clicked() {
                         self.show_routing = true;
                     }
-                    if ui.button("Help").clicked() {
+                    if ui.button("ヘルプ").clicked() {
                         self.show_about = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -219,18 +253,18 @@ impl AnalyzerApp {
                             .color(GREEN_BRIGHT),
                     );
                     ui.add_space(16.0);
-                    if widgets::nav_item(ui, "I/O", "INPUT", false, true).clicked() {
+                    if widgets::nav_item(ui, "I/O", "入力", false, true).clicked() {
                         self.show_routing = true;
                     }
-                    let _ = widgets::nav_item(ui, "--", "OUTPUT", false, false);
-                    let _ = widgets::nav_item(ui, "EQ", "FILTERS", false, false);
-                    if widgets::nav_item(ui, "~", "ANALYSIS", !self.history_only, true).clicked() {
+                    let _ = widgets::nav_item(ui, "--", "出力", false, false);
+                    let _ = widgets::nav_item(ui, "EQ", "フィルタ", false, false);
+                    if widgets::nav_item(ui, "~", "解析", !self.history_only, true).clicked() {
                         self.history_only = false;
                     }
-                    if widgets::nav_item(ui, "H", "HISTORY", self.history_only, true).clicked() {
+                    if widgets::nav_item(ui, "H", "履歴", self.history_only, true).clicked() {
                         self.history_only = true;
                     }
-                    let _ = widgets::nav_item(ui, "EX", "EXPORT", false, false);
+                    let _ = widgets::nav_item(ui, "EX", "書出", false, false);
                 });
             });
     }
@@ -249,12 +283,21 @@ impl AnalyzerApp {
                     let stats = self.runtime.stats();
                     let stream_errors = stats.stream_errors.load(Ordering::Relaxed);
                     let dropped_audio = stats.dropped_audio_frames.load(Ordering::Relaxed);
+                    let receiving = self
+                        .last_snapshot_time
+                        .is_some_and(|last| ctx.input(|input| input.time) - last < 1.0);
                     ui.colored_label(
-                        if stream_errors == 0 { GREEN } else { RED },
-                        if stream_errors == 0 {
-                            "● SYSTEM_READY"
+                        if stream_errors == 0 && receiving {
+                            GREEN
                         } else {
-                            "● STREAM_ERROR"
+                            RED
+                        },
+                        if stream_errors != 0 {
+                            "● ストリーム異常"
+                        } else if receiving {
+                            "● システム正常"
+                        } else {
+                            "● 入力待機 / 停止"
                         },
                     );
                     ui.label(format!("AUDIO_DROPS: {dropped_audio}"));
@@ -264,12 +307,15 @@ impl AnalyzerApp {
                     ));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(8.0);
-                        let info = self.runtime.info();
-                        ui.colored_label(
-                            CYAN,
-                            format!("{} Hz / {} ch", info.sample_rate, info.channels),
-                        );
-                        ui.label(&info.device_name);
+                        if let Some(info) = self.runtime.info() {
+                            ui.colored_label(
+                                CYAN,
+                                format!("{} Hz / {} ch", info.sample_rate, info.channels),
+                            );
+                            ui.label(&info.device_name);
+                        } else {
+                            ui.label("入力未接続");
+                        }
                     });
                 });
             });
@@ -287,20 +333,7 @@ impl AnalyzerApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if self.history_only {
-                            widgets::module(
-                                ui,
-                                "TIMELINE_HISTORY",
-                                true,
-                                ui.available_height().max(500.0),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("BUFFER: 300s")
-                                            .font(theme::bold(9.0))
-                                            .color(GREEN),
-                                    );
-                                },
-                                |ui| widgets::history_plot(ui, self.history.points(), 520.0),
-                            );
+                            self.history_module(ui, ui.available_height().max(500.0), true);
                             return;
                         }
 
@@ -313,7 +346,7 @@ impl AnalyzerApp {
                         self.analysis_module(ui, plot_height);
                         if self.show_timeline {
                             ui.add_space(8.0);
-                            self.timeline_module(ui, 170.0);
+                            self.history_module(ui, 170.0, false);
                         }
                     });
             });
@@ -376,7 +409,7 @@ impl AnalyzerApp {
     fn signal_metrics(&mut self, ui: &mut egui::Ui) {
         widgets::module(
             ui,
-            "SIGNAL_METRICS",
+            "SIGNAL_METRICS / 信号レベル",
             false,
             208.0,
             |_| {},
@@ -384,21 +417,21 @@ impl AnalyzerApp {
                 ui.columns(3, |columns| {
                     widgets::metric(
                         &mut columns[0],
-                        "MEAS RMS",
+                        "測定 RMS",
                         Some(self.measurement_level.rms_dbfs),
                         "dBFS",
                         CYAN,
                     );
                     widgets::metric(
                         &mut columns[1],
-                        "REF RMS",
+                        "基準 RMS",
                         self.reference_level.map(|level| level.rms_dbfs),
                         "dBFS",
                         GREEN,
                     );
                     widgets::metric(
                         &mut columns[2],
-                        "CORRELATION",
+                        "相関",
                         self.phase_correlation,
                         "-1 / +1",
                         GREEN_BRIGHT,
@@ -407,7 +440,7 @@ impl AnalyzerApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("MEAS PEAK")
+                        RichText::new("測定 PEAK")
                             .font(theme::bold(8.0))
                             .color(TEXT_MUTED),
                     );
@@ -417,7 +450,7 @@ impl AnalyzerApp {
                     );
                     ui.add_space(12.0);
                     ui.label(
-                        RichText::new("REF PEAK")
+                        RichText::new("基準 PEAK")
                             .font(theme::bold(8.0))
                             .color(TEXT_MUTED),
                     );
@@ -436,7 +469,7 @@ impl AnalyzerApp {
     fn peak_meters(&mut self, ui: &mut egui::Ui) {
         widgets::module(
             ui,
-            "PEAK_LEVEL_METERS",
+            "PEAK_LEVEL_METERS / ピークメーター",
             false,
             208.0,
             |_| {},
@@ -446,7 +479,7 @@ impl AnalyzerApp {
                         ui,
                         self.reference_level.map_or(-120.0, |level| level.peak_dbfs),
                         self.reference_held_dbfs,
-                        "REF",
+                        "基準",
                         GREEN,
                     );
                     ui.add_space(22.0);
@@ -454,7 +487,7 @@ impl AnalyzerApp {
                         ui,
                         self.measurement_level.peak_dbfs,
                         self.measurement_held_dbfs,
-                        "MEAS",
+                        "測定",
                         CYAN,
                     );
                     ui.vertical(|ui| {
@@ -474,7 +507,7 @@ impl AnalyzerApp {
     fn phase_scope(&mut self, ui: &mut egui::Ui) {
         widgets::module(
             ui,
-            "PHASE_CORRELATION",
+            "PHASE_CORRELATION / 位相相関",
             true,
             208.0,
             |_| {},
@@ -483,7 +516,7 @@ impl AnalyzerApp {
                     widgets::vectorscope(ui, &self.scope_points, self.phase_correlation);
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("N/A — REFERENCE DISABLED").color(TEXT_MUTED));
+                        ui.label(RichText::new("N/A — 基準入力が無効です").color(TEXT_MUTED));
                     });
                 }
             },
@@ -493,20 +526,28 @@ impl AnalyzerApp {
     fn analysis_module(&mut self, ui: &mut egui::Ui, height: f32) {
         let view = self.analysis_view;
         let hold_active = self.display_hold.active();
-        let sample_rate = self.runtime.info().sample_rate;
+        let sample_rate = self.runtime.info().map_or(0, |info| info.sample_rate);
+        let input_range = if sample_rate == 0 {
+            "入力未接続".to_owned()
+        } else {
+            format!(
+                "範囲: 20 Hz–{}  |  SR: {sample_rate} Hz",
+                format_frequency(sample_rate as f64 * 0.5)
+            )
+        };
         let mut toggle_hold = false;
         widgets::module(
             ui,
-            "PRECISION_ANALYSIS",
+            "PRECISION_ANALYSIS / 周波数解析",
             false,
             height,
             |ui| {
-                if widgets::chip(ui, "HOLD", hold_active).clicked() {
+                if widgets::chip(ui, "保持 / HOLD", hold_active).clicked() {
                     toggle_hold = true;
                 }
-                let _ = widgets::chip(ui, "FAST", true);
+                let _ = widgets::chip(ui, "高速 / FAST", true);
                 ui.label(
-                    RichText::new(format!("SR: {sample_rate} Hz"))
+                    RichText::new(input_range)
                         .font(theme::bold(9.0))
                         .color(TEXT_MUTED),
                 );
@@ -534,13 +575,16 @@ impl AnalyzerApp {
                 vec2(ui.available_width(), height),
                 Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
-                    ui.label(RichText::new("N/A — REFERENCE DISABLED").color(TEXT_MUTED));
+                    ui.label(RichText::new("N/A — 基準入力が無効です").color(TEXT_MUTED));
                 },
             );
             return;
         }
 
-        let nyquist = self.runtime.info().sample_rate as f64 / 2.0;
+        let nyquist = self
+            .runtime
+            .info()
+            .map_or(24_000.0, |info| info.sample_rate as f64 / 2.0);
         let (points, y_min, y_max, unit) = match self.analysis_view {
             AnalysisView::Spectrum => (&self.measurement_points, -120.0, 6.0, "dBFS"),
             AnalysisView::Transfer => (&self.transfer_points, -60.0, 20.0, "dB"),
@@ -549,13 +593,15 @@ impl AnalyzerApp {
         };
         let mut plot = Plot::new("precision_analysis_plot")
             .height(height.max(220.0))
-            .allow_drag(true)
-            .allow_zoom(true)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
             .show_grid(true)
             .include_x(20.0_f64.log10())
             .include_x(nyquist.log10())
             .include_y(y_min)
             .include_y(y_max)
+            .x_grid_spacer(move |_| frequency_grid_marks(nyquist))
             .x_axis_formatter(|mark, _| format_frequency(10.0_f64.powf(mark.value)))
             .y_axis_formatter(move |mark, _| {
                 if unit.is_empty() {
@@ -568,37 +614,57 @@ impl AnalyzerApp {
             plot = plot.legend(Legend::default());
         }
         plot.show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                [20.0_f64.log10(), y_min],
+                [nyquist.log10(), y_max],
+            ));
             let measurement = Line::new(PlotPoints::from_iter(points.iter().copied()))
                 .color(CYAN)
                 .width(1.8)
-                .name("Measurement");
+                .name("測定");
             plot_ui.line(measurement);
             if self.analysis_view == AnalysisView::Spectrum && self.has_reference {
                 plot_ui.line(
                     Line::new(PlotPoints::from_iter(self.reference_points.iter().copied()))
                         .color(GREEN.gamma_multiply(0.55))
                         .width(1.1)
-                        .name("Reference"),
+                        .name("基準"),
                 );
             }
         });
     }
 
-    fn timeline_module(&self, ui: &mut egui::Ui, height: f32) {
+    fn history_module(&mut self, ui: &mut egui::Ui, height: f32, accent: bool) {
+        let current_view = self.history_view;
+        let mut selected_view = current_view;
+        let points = self.history.points();
+        let texture = self.spectrogram_texture.as_ref();
+        let sample_rate = self.runtime.info().map_or(0, |info| info.sample_rate);
         widgets::module(
             ui,
-            "TIMELINE_HISTORY",
-            false,
+            "TIMELINE_HISTORY / 300秒履歴",
+            accent,
             height,
             |ui| {
+                for view in HistoryView::ALL.into_iter().rev() {
+                    if widgets::chip(ui, view.label(), view == current_view).clicked() {
+                        selected_view = view;
+                    }
+                }
                 ui.label(
-                    RichText::new("BUFFER: 300s")
+                    RichText::new("記録: 300秒")
                         .font(theme::bold(9.0))
                         .color(GREEN),
                 );
             },
-            |ui| widgets::history_plot(ui, self.history.points(), height - 58.0),
+            |ui| match current_view {
+                HistoryView::Level => widgets::history_plot(ui, points, height - 58.0),
+                HistoryView::Spectrum => {
+                    widgets::spectrogram(ui, texture, sample_rate, height - 58.0)
+                }
+            },
         );
+        self.history_view = selected_view;
     }
 
     fn routing_window(&mut self, ctx: &egui::Context) {
@@ -606,38 +672,42 @@ impl AnalyzerApp {
             return;
         }
         let mut open = self.show_routing;
-        egui::Window::new("INPUT ROUTING")
+        egui::Window::new("入力ルーティング / INPUT ROUTING")
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                let channels = self.runtime.info().channels;
+                let Some(info) = self.runtime.info() else {
+                    ui.label("入力を接続するとチャンネルを設定できます。");
+                    return;
+                };
+                let channels = info.channels;
                 let previous = ChannelRoute {
                     reference: self.reference_channel,
                     measurement: self.measurement_channel,
                 };
-                egui::ComboBox::from_label("Reference")
+                egui::ComboBox::from_label("基準入力 / Reference")
                     .selected_text(self.reference_channel.map_or_else(
-                        || "Disabled".to_owned(),
-                        |channel| format!("Input {}", channel + 1),
+                        || "無効".to_owned(),
+                        |channel| format!("入力 {}", channel + 1),
                     ))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.reference_channel, None, "Disabled");
+                        ui.selectable_value(&mut self.reference_channel, None, "無効");
                         for channel in 0..channels {
                             ui.selectable_value(
                                 &mut self.reference_channel,
                                 Some(channel),
-                                format!("Input {}", channel + 1),
+                                format!("入力 {}", channel + 1),
                             );
                         }
                     });
-                egui::ComboBox::from_label("Measurement")
-                    .selected_text(format!("Input {}", self.measurement_channel + 1))
+                egui::ComboBox::from_label("測定入力 / Measurement")
+                    .selected_text(format!("入力 {}", self.measurement_channel + 1))
                     .show_ui(ui, |ui| {
                         for channel in 0..channels {
                             ui.selectable_value(
                                 &mut self.measurement_channel,
                                 channel,
-                                format!("Input {}", channel + 1),
+                                format!("入力 {}", channel + 1),
                             );
                         }
                     });
@@ -647,8 +717,12 @@ impl AnalyzerApp {
                 };
                 if route != previous {
                     self.route_error = self.runtime.set_route(route).err();
-                    self.history.clear();
-                    self.scope_points.clear();
+                    if self.route_error.is_none() {
+                        self.reset_display(route);
+                    } else {
+                        self.reference_channel = previous.reference;
+                        self.measurement_channel = previous.measurement;
+                    }
                 }
                 if let Some(error) = &self.route_error {
                     ui.colored_label(RED, error);
@@ -662,17 +736,102 @@ impl AnalyzerApp {
             return;
         }
         let mut open = self.show_settings;
-        egui::Window::new("DISPLAY SETTINGS")
+        egui::Window::new("表示設定 / DISPLAY SETTINGS")
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.checkbox(&mut self.show_top_cards, "Show signal cards");
-                ui.checkbox(&mut self.show_timeline, "Show timeline history");
+                ui.checkbox(&mut self.show_top_cards, "信号カードを表示");
+                ui.checkbox(&mut self.show_timeline, "履歴パネルを表示");
                 ui.separator();
-                ui.label("FFT: 2048 points / 50% overlap");
-                ui.label("Spectrum response: FAST");
+                ui.label("FFT: 2048点 / 50%オーバーラップ");
+                ui.label("スペクトラム応答: 高速 / FAST");
             });
         self.show_settings = open;
+    }
+
+    fn reset_display(&mut self, route: ChannelRoute) {
+        self.reference_channel = route.reference;
+        self.measurement_channel = route.measurement;
+        self.route_error = None;
+        self.history.clear();
+        self.spectrogram_texture = None;
+        self.scope_points.clear();
+        self.reference_points.clear();
+        self.measurement_points.clear();
+        self.transfer_points.clear();
+        self.phase_points.clear();
+        self.coherence_points.clear();
+        self.measurement_level = SignalLevel::default();
+        self.reference_level = None;
+        self.phase_correlation = None;
+        self.measurement_peak_hold = PeakHold::default();
+        self.reference_peak_hold = PeakHold::default();
+        self.measurement_held_dbfs = -120.0;
+        self.reference_held_dbfs = -120.0;
+        self.latest_sequence = None;
+        self.latest_window_start = 0;
+        self.last_snapshot_time = None;
+        self.has_reference = route.reference.is_some();
+        self.display_hold = DisplayHold::default();
+    }
+
+    fn poll_connection(&mut self) {
+        self.runtime.poll();
+        if self.runtime.state() != &self.display_connection {
+            self.display_connection = self.runtime.state().clone();
+            let route = self
+                .runtime
+                .info()
+                .map_or(ChannelRoute::default_for_channels(1), |info| {
+                    info.initial_route
+                });
+            self.reset_display(route);
+        }
+    }
+
+    fn connection_bar(&mut self, ctx: &egui::Context) {
+        TopBottomPanel::top("input_connection").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                match self.runtime.state() {
+                    ConnectionState::Stopped => {
+                        ui.label("入力未接続");
+                    }
+                    ConnectionState::Starting => {
+                        ui.spinner();
+                        ui.label("入力デバイスに接続中…");
+                    }
+                    ConnectionState::Running => {
+                        ui.colored_label(GREEN, "入力接続済み");
+                    }
+                    ConnectionState::Stopping => {
+                        ui.spinner();
+                        ui.label("入力を停止中…");
+                    }
+                    ConnectionState::Failed(error) => {
+                        ui.colored_label(RED, format!("入力接続に失敗: {error}"));
+                    }
+                }
+                if matches!(
+                    self.runtime.state(),
+                    ConnectionState::Stopped | ConnectionState::Failed(_)
+                ) && ui.button("接続 / 再試行").clicked()
+                    && let Err(error) = self.runtime.start()
+                {
+                    self.route_error = Some(error);
+                }
+                if matches!(
+                    self.runtime.state(),
+                    ConnectionState::Starting | ConnectionState::Running
+                ) && ui.button("停止").clicked()
+                {
+                    self.runtime.stop();
+                    self.reset_display(ChannelRoute::default_for_channels(1));
+                }
+                if let Some(error) = &self.route_error {
+                    ui.colored_label(RED, error);
+                }
+            });
+        });
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -680,7 +839,7 @@ impl AnalyzerApp {
             return;
         }
         let mut open = self.show_about;
-        egui::Window::new("ABOUT")
+        egui::Window::new("このアプリについて / ABOUT")
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -689,8 +848,8 @@ impl AnalyzerApp {
                         .font(theme::bold(18.0))
                         .color(GREEN_BRIGHT),
                 );
-                ui.label("Synchronous two-channel precision analysis");
-                ui.label("JetBrains Mono licensed under SIL Open Font License 1.1");
+                ui.label("同期2チャンネル精密解析");
+                ui.label("JetBrains Mono: SIL Open Font License 1.1");
             });
         self.show_about = open;
     }
@@ -698,13 +857,21 @@ impl AnalyzerApp {
 
 impl eframe::App for AnalyzerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
+}
+
+impl AnalyzerApp {
+    fn tick(&mut self, ctx: &egui::Context) {
+        self.poll_connection();
         if let Some(snapshot) = self.runtime.take_latest() {
             let now = ctx.input(|input| input.time);
             let discontinuities = self.runtime.stats().discontinuities.load(Ordering::Relaxed);
-            self.update_snapshot(snapshot, now, discontinuities);
+            self.update_snapshot(ctx, snapshot, now, discontinuities);
         }
 
         self.top_bar(ctx);
+        self.connection_bar(ctx);
         self.status_bar(ctx);
         self.side_bar(ctx);
         self.dashboard(ctx);
@@ -717,8 +884,99 @@ impl eframe::App for AnalyzerApp {
 
 fn format_frequency(frequency: f64) -> String {
     if frequency >= 1_000.0 {
-        format!("{:.1}k", frequency / 1_000.0)
+        let khz = frequency / 1_000.0;
+        if (khz - khz.round()).abs() < 0.01 {
+            format!("{khz:.0} kHz")
+        } else {
+            format!("{khz:.1} kHz")
+        }
     } else {
-        format!("{frequency:.0}")
+        format!("{frequency:.0} Hz")
+    }
+}
+
+fn frequency_grid_marks(nyquist: f64) -> Vec<GridMark> {
+    let mut frequencies: Vec<f64> = [
+        20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0, 50_000.0,
+        100_000.0, 200_000.0,
+    ]
+    .into_iter()
+    .filter(|frequency| *frequency <= nyquist)
+    .collect();
+    if frequencies
+        .last()
+        .is_none_or(|last| (last - nyquist).abs() > nyquist * 0.001)
+    {
+        frequencies.push(nyquist);
+    }
+    frequencies
+        .into_iter()
+        .map(|frequency| GridMark {
+            value: frequency.log10(),
+            step_size: if frequency == 20.0 || frequency.log10().fract().abs() < 0.001 {
+                1.0
+            } else {
+                0.3
+            },
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::RuntimeStats,
+        source::{InputSource, OpenedSource},
+    };
+    use std::{
+        sync::{Arc, atomic::AtomicBool},
+        thread,
+        time::Instant,
+    };
+
+    struct UnavailableInput;
+    impl InputSource for UnavailableInput {
+        fn open(&mut self, _: Arc<RuntimeStats>, _: &AtomicBool) -> Result<OpenedSource, String> {
+            Err("test input unavailable".to_owned())
+        }
+    }
+
+    #[test]
+    fn full_app_renders_disconnected_and_failed_at_supported_sizes() {
+        for size in [vec2(760.0, 640.0), vec2(1440.0, 900.0)] {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut app = AnalyzerApp::with_controller(
+                AnalyzerController::with_source(UnavailableInput).unwrap(),
+            );
+            let draw = |app: &mut AnalyzerApp| {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| app.tick(ctx),
+                );
+                assert!(!output.shapes.is_empty());
+            };
+            draw(&mut app);
+            app.runtime.start().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.poll_connection();
+                if matches!(app.runtime.state(), ConnectionState::Failed(_)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            app.show_routing = true;
+            app.history_view = HistoryView::Spectrum;
+            draw(&mut app);
+            assert!(app.latest_sequence.is_none());
+            assert_eq!(app.measurement_level.peak_dbfs, -120.0);
+            assert!(app.history.points().is_empty());
+        }
     }
 }
