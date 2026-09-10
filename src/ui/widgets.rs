@@ -8,7 +8,7 @@ use eframe::egui::{
 use crate::model::StereoFrame;
 
 use super::{
-    state::{HISTORY_SECONDS, HISTORY_SPECTRUM_BANDS, HistoryPoint, HistoryViewport},
+    state::{HISTORY_SPECTRUM_BANDS, HistoryPoint, HistoryViewport},
     theme::{
         self, BACKGROUND, CYAN, GREEN, GREEN_BRIGHT, OUTLINE, RED, SURFACE, SURFACE_HIGH,
         SURFACE_LOW, TEXT, TEXT_MUTED, YELLOW,
@@ -312,7 +312,11 @@ pub fn history_plot(ui: &mut Ui, points: &VecDeque<HistoryPoint>, height: f32) {
     }
 }
 
-pub fn spectrogram_image(points: &VecDeque<HistoryPoint>, width: usize) -> ColorImage {
+pub fn spectrogram_image(
+    points: &VecDeque<HistoryPoint>,
+    width: usize,
+    viewport: HistoryViewport,
+) -> ColorImage {
     let mut image = ColorImage::new([width, HISTORY_SPECTRUM_BANDS], BACKGROUND);
     if width == 0 {
         return image;
@@ -320,23 +324,24 @@ pub fn spectrogram_image(points: &VecDeque<HistoryPoint>, width: usize) -> Color
     let Some(last) = points.back() else {
         return image;
     };
-    let start = last.seconds - HISTORY_SECONDS;
+    let (start, end) = viewport.time_bounds(last.seconds);
+    let span = viewport.visible_seconds();
     let mut levels = vec![-120.0_f32; width * HISTORY_SPECTRUM_BANDS];
     let mut gap_columns = vec![false; width];
     for point in points
         .iter()
-        .filter(|point| point.gap && point.seconds >= start)
+        .filter(|point| point.gap && point.seconds >= start && point.seconds <= end)
     {
-        let x = (((point.seconds - start) / HISTORY_SECONDS) * width as f64)
+        let x = (((point.seconds - start) / span) * width as f64)
             .floor()
             .clamp(0.0, (width - 1) as f64) as usize;
         gap_columns[x] = true;
     }
     for point in points {
-        if point.seconds < start {
+        if point.seconds < start || point.seconds > end {
             continue;
         }
-        let x = (((point.seconds - start) / HISTORY_SECONDS) * width as f64)
+        let x = (((point.seconds - start) / span) * width as f64)
             .floor()
             .clamp(0.0, (width - 1) as f64) as usize;
         for (band, dbfs) in point.spectrum_dbfs.iter().copied().enumerate() {
@@ -373,11 +378,10 @@ pub fn spectrogram(
         pos2(rect.right() - 8.0, rect.bottom() - 20.0),
     );
     if let Some(texture) = texture {
-        let (uv_start, uv_end) = viewport.uv_bounds();
         ui.painter().image(
             texture.id(),
             graph,
-            Rect::from_min_max(pos2(uv_start, 0.0), pos2(uv_end, 1.0)),
+            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
             Color32::WHITE,
         );
     } else {
@@ -529,6 +533,11 @@ fn db_normalized(dbfs: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        dsp::SpectrumAnalyzer,
+        model::{AUDIO_BLOCK_FRAMES, AudioBlock},
+        ui::state::HistoryBuffer,
+    };
 
     #[test]
     fn spectrogram_aggregates_peaks_and_marks_discontinuities() {
@@ -540,7 +549,7 @@ mod tests {
             gap: false,
         };
         let mut points = VecDeque::from([point]);
-        let image = spectrogram_image(&points, 600);
+        let image = spectrogram_image(&points, 600, HistoryViewport::default());
         assert_eq!(image.pixels[599], spectrum_color(-3.0));
         assert_eq!(image.pixels[0], BACKGROUND);
         points.push_back(HistoryPoint {
@@ -548,10 +557,51 @@ mod tests {
             gap: true,
             ..point
         });
-        let image = spectrogram_image(&points, 600);
+        let image = spectrogram_image(&points, 600, HistoryViewport::default());
         assert!(image.pixels.iter().any(|pixel| *pixel != BACKGROUND));
         assert!(image.pixels.iter().any(|pixel| pixel.r() > pixel.b()));
-        assert!(spectrogram_image(&points, 0).pixels.is_empty());
+        assert!(
+            spectrogram_image(&points, 0, HistoryViewport::default())
+                .pixels
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fft_tone_reaches_the_frequency_history_image() {
+        let sample_rate = 48_000;
+        let tone_bin = 64;
+        let mut analyzer = SpectrumAnalyzer::new(sample_rate);
+        let mut snapshot = None;
+        for block_index in 0..(crate::model::FFT_SIZE / AUDIO_BLOCK_FRAMES) {
+            let mut block = AudioBlock {
+                start_frame: (block_index * AUDIO_BLOCK_FRAMES) as u64,
+                valid_frames: AUDIO_BLOCK_FRAMES,
+                ..AudioBlock::default()
+            };
+            for frame_index in 0..AUDIO_BLOCK_FRAMES {
+                let index = block_index * AUDIO_BLOCK_FRAMES + frame_index;
+                block.frames[frame_index].measurement =
+                    (2.0 * std::f32::consts::PI * tone_bin as f32 * index as f32
+                        / crate::model::FFT_SIZE as f32)
+                        .sin();
+            }
+            snapshot = analyzer.process_block(&block).or(snapshot);
+        }
+
+        let mut history = HistoryBuffer::default();
+        assert!(history.push(&snapshot.expect("FFT snapshot"), 0));
+        let width = 600;
+        let image = spectrogram_image(history.points(), width, HistoryViewport::default());
+        assert!(
+            image
+                .pixels
+                .iter()
+                .skip(width - 1)
+                .step_by(width)
+                .any(|pixel| *pixel != BACKGROUND),
+            "the newest FFT spectrum should be visible at the live edge"
+        );
     }
 
     #[test]

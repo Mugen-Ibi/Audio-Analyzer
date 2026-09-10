@@ -51,7 +51,7 @@ pub struct HistoryViewport {
 impl Default for HistoryViewport {
     fn default() -> Self {
         Self {
-            zoom_index: 0,
+            zoom_index: 3,
             offset_from_live: 0.0,
         }
     }
@@ -91,10 +91,9 @@ impl HistoryViewport {
         self.offset_from_live = 0.0;
     }
 
-    pub fn uv_bounds(self) -> (f32, f32) {
-        let end = 1.0 - self.offset_from_live / HISTORY_SECONDS;
-        let start = end - self.visible_seconds() / HISTORY_SECONDS;
-        (start.clamp(0.0, 1.0) as f32, end.clamp(0.0, 1.0) as f32)
+    pub fn time_bounds(self, live_seconds: f64) -> (f64, f64) {
+        let end = live_seconds - self.offset_from_live;
+        (end - self.visible_seconds(), end)
     }
 
     fn clamp_offset(&mut self) {
@@ -407,12 +406,12 @@ mod tests {
     #[test]
     fn history_viewport_zooms_and_pans_within_fixed_window() {
         let mut viewport = HistoryViewport::default();
-        assert_eq!(viewport.uv_bounds(), (0.0, 1.0));
+        assert_eq!(viewport.visible_seconds(), 30.0);
+        assert_eq!(viewport.time_bounds(100.0), (70.0, 100.0));
         viewport.zoom_in();
-        assert_eq!(viewport.visible_seconds(), 120.0);
-        assert_eq!(viewport.uv_bounds(), (0.6, 1.0));
+        assert_eq!(viewport.visible_seconds(), 10.0);
         viewport.pan_older();
-        assert_eq!(viewport.uv_bounds(), (0.4, 0.8));
+        assert_eq!(viewport.time_bounds(100.0), (85.0, 95.0));
         viewport.jump_live();
         assert_eq!(viewport.offset_from_live(), 0.0);
     }

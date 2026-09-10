@@ -2,13 +2,13 @@ mod state;
 mod theme;
 mod widgets;
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{cell::Cell, sync::atomic::Ordering, time::Duration};
 
 use eframe::egui::{
     self, Align, CentralPanel, Frame, Layout, RichText, ScrollArea, SidePanel, Stroke,
     TextureHandle, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
 };
-use egui_plot::{GridMark, Legend, Line, Plot, PlotBounds, PlotPoints};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints};
 
 use crate::{
     controller::{AnalyzerController, ConnectionState},
@@ -49,6 +49,7 @@ pub struct AnalyzerApp {
     history_view: HistoryView,
     history_viewport: HistoryViewport,
     spectrogram_texture: Option<TextureHandle>,
+    spectrogram_dirty: bool,
     display_hold: DisplayHold,
     analysis_view: AnalysisView,
     has_reference: bool,
@@ -104,6 +105,7 @@ impl AnalyzerApp {
             history_view: HistoryView::default(),
             history_viewport: HistoryViewport::default(),
             spectrogram_texture: None,
+            spectrogram_dirty: true,
             display_hold: DisplayHold::default(),
             analysis_view: AnalysisView::Spectrum,
             has_reference: route.reference.is_some(),
@@ -124,7 +126,7 @@ impl AnalyzerApp {
 
     fn update_snapshot(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         snapshot: AnalysisSnapshot,
         now: f64,
         discontinuities: u64,
@@ -150,13 +152,7 @@ impl AnalyzerApp {
             self.reference_held_dbfs = -120.0;
         }
         if self.history.push(&snapshot, discontinuities) {
-            let image = widgets::spectrogram_image(self.history.points(), 600);
-            if let Some(texture) = &mut self.spectrogram_texture {
-                texture.set(image, TextureOptions::NEAREST);
-            } else {
-                self.spectrogram_texture =
-                    Some(ctx.load_texture("frequency_history", image, TextureOptions::NEAREST));
-            }
+            self.spectrogram_dirty = true;
         }
         self.measurement_level = snapshot.measurement_level;
         self.reference_level = snapshot.reference_level;
@@ -696,6 +692,7 @@ impl AnalyzerApp {
             )
         };
         let mut toggle_hold = false;
+        let reset_view = Cell::new(false);
         widgets::module(
             ui,
             "PRECISION_ANALYSIS / 周波数解析",
@@ -704,6 +701,12 @@ impl AnalyzerApp {
             |ui| {
                 if widgets::chip(ui, "保持 / HOLD", hold_active).clicked() {
                     toggle_hold = true;
+                }
+                if widgets::chip(ui, "全体表示", false)
+                    .on_hover_text("ズームと移動をリセット")
+                    .clicked()
+                {
+                    reset_view.set(true);
                 }
                 let _ = widgets::chip(ui, "高速 / FAST", true);
                 ui.label(
@@ -721,7 +724,7 @@ impl AnalyzerApp {
                     }
                 });
                 ui.add_space(4.0);
-                self.analysis_plot(ui, height - 82.0);
+                self.analysis_plot(ui, height - 82.0, reset_view.get());
             },
         );
         if toggle_hold {
@@ -729,7 +732,7 @@ impl AnalyzerApp {
         }
     }
 
-    fn analysis_plot(&self, ui: &mut egui::Ui, height: f32) {
+    fn analysis_plot(&self, ui: &mut egui::Ui, height: f32, reset_view: bool) {
         let pair_active = self.has_reference
             && self.measurement_signal.active()
             && self.reference_signal.active();
@@ -759,11 +762,13 @@ impl AnalyzerApp {
             AnalysisView::Phase => (&self.phase_points, -180.0, 180.0, "deg"),
             AnalysisView::Coherence => (&self.coherence_points, 0.0, 1.0, ""),
         };
-        let mut plot = Plot::new("precision_analysis_plot")
+        let mut plot = Plot::new(format!("precision_analysis_plot_{:?}", self.analysis_view))
             .height(height.max(220.0))
-            .allow_drag(false)
-            .allow_zoom(false)
-            .allow_scroll(false)
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .allow_boxed_zoom(true)
+            .allow_double_click_reset(true)
             .show_grid(true)
             .include_x(20.0_f64.log10())
             .include_x(nyquist.log10())
@@ -781,11 +786,10 @@ impl AnalyzerApp {
         if self.analysis_view == AnalysisView::Spectrum {
             plot = plot.legend(Legend::default());
         }
-        plot.show(ui, |plot_ui| {
-            plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                [20.0_f64.log10(), y_min],
-                [nyquist.log10(), y_max],
-            ));
+        if reset_view {
+            plot = plot.reset();
+        }
+        let response = plot.show(ui, |plot_ui| {
             let measurement = Line::new(PlotPoints::from_iter(points.iter().copied()))
                 .color(CYAN)
                 .width(1.8)
@@ -800,6 +804,9 @@ impl AnalyzerApp {
                 );
             }
         });
+        response
+            .response
+            .on_hover_text("ホイール: 拡大・縮小 / ドラッグ: 移動 / 右ドラッグ: 範囲拡大 / ダブルクリック: 全体表示");
     }
 
     fn history_module(&mut self, ui: &mut egui::Ui, height: f32, accent: bool) {
@@ -811,6 +818,26 @@ impl AnalyzerApp {
         let mut pan_older = false;
         let mut pan_newer = false;
         let mut jump_live = false;
+        let texture_width = ((ui.available_width() - 80.0).max(64.0).round() as usize).min(2_048);
+        if current_view == HistoryView::Spectrum
+            && (self.spectrogram_dirty
+                || self
+                    .spectrogram_texture
+                    .as_ref()
+                    .is_none_or(|texture| texture.size()[0] != texture_width))
+        {
+            let image = widgets::spectrogram_image(self.history.points(), texture_width, viewport);
+            if let Some(texture) = &mut self.spectrogram_texture {
+                texture.set(image, TextureOptions::NEAREST);
+            } else {
+                self.spectrogram_texture = Some(ui.ctx().load_texture(
+                    "frequency_history",
+                    image,
+                    TextureOptions::NEAREST,
+                ));
+            }
+            self.spectrogram_dirty = false;
+        }
         let points = self.history.points();
         let texture = self.spectrogram_texture.as_ref();
         let sample_rate = self.runtime.info().map_or(0, |info| info.sample_rate);
@@ -820,19 +847,6 @@ impl AnalyzerApp {
             accent,
             height,
             |ui| {
-                if current_view == HistoryView::Spectrum {
-                    jump_live =
-                        widgets::chip(ui, "現在へ", viewport.offset_from_live() == 0.0).clicked();
-                    pan_newer = widgets::chip(ui, "新しい →", false).clicked();
-                    pan_older = widgets::chip(ui, "← 過去", false).clicked();
-                    zoom_out = widgets::chip(ui, "縮小 −", false).clicked();
-                    zoom_in = widgets::chip(ui, "拡大 +", false).clicked();
-                    ui.label(
-                        RichText::new(format!("表示: {:.0}秒", viewport.visible_seconds()))
-                            .font(theme::bold(9.0))
-                            .color(CYAN),
-                    );
-                }
                 for view in HistoryView::ALL.into_iter().rev() {
                     if widgets::chip(ui, view.label(), view == current_view).clicked() {
                         selected_view = view;
@@ -847,25 +861,44 @@ impl AnalyzerApp {
             |ui| match current_view {
                 HistoryView::Level => widgets::history_plot(ui, points, height - 58.0),
                 HistoryView::Spectrum => {
-                    widgets::spectrogram(ui, texture, sample_rate, viewport, height - 58.0)
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("表示: {:.0}秒", viewport.visible_seconds()))
+                                .font(theme::bold(9.0))
+                                .color(CYAN),
+                        );
+                        zoom_in = widgets::chip(ui, "拡大 +", false).clicked();
+                        zoom_out = widgets::chip(ui, "縮小 −", false).clicked();
+                        pan_older = widgets::chip(ui, "← 過去", false).clicked();
+                        pan_newer = widgets::chip(ui, "新しい →", false).clicked();
+                        jump_live = widgets::chip(ui, "現在へ", viewport.offset_from_live() == 0.0)
+                            .clicked();
+                    });
+                    ui.add_space(4.0);
+                    widgets::spectrogram(ui, texture, sample_rate, viewport, height - 88.0)
                 }
             },
         );
         self.history_view = selected_view;
         if zoom_in {
             self.history_viewport.zoom_in();
+            self.spectrogram_dirty = true;
         }
         if zoom_out {
             self.history_viewport.zoom_out();
+            self.spectrogram_dirty = true;
         }
         if pan_older {
             self.history_viewport.pan_older();
+            self.spectrogram_dirty = true;
         }
         if pan_newer {
             self.history_viewport.pan_newer();
+            self.spectrogram_dirty = true;
         }
         if jump_live {
             self.history_viewport.jump_live();
+            self.spectrogram_dirty = true;
         }
     }
 
@@ -993,6 +1026,7 @@ impl AnalyzerApp {
         self.history.clear();
         self.history_viewport = HistoryViewport::default();
         self.spectrogram_texture = None;
+        self.spectrogram_dirty = true;
         self.scope_points.clear();
         self.reference_points.clear();
         self.measurement_points.clear();
