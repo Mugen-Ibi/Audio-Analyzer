@@ -89,3 +89,15 @@ cargo test --locked --test live_audio -- --ignored --nocapture
 ```
 
 今回のVisualizer設計・画面確認・検証は [AUDIO_VISUALIZER.md](docs/AUDIO_VISUALIZER.md) を参照してください。基礎実装の設計と受入対応は [IMPLEMENTATION_V03.md](docs/IMPLEMENTATION_V03.md)、以前の検証結果は [VALIDATION_V03.md](docs/VALIDATION_V03.md) にあります。以前の [ARCHITECTURE.md](ARCHITECTURE.md) と [REVIEW_PLAN.md](REVIEW_PLAN.md) は過去時点の記録です。
+
+## ASIO-enabled release distribution
+
+The ASIO-enabled release executable and combined corresponding source are distributed under GNU GPL version 3. Original project MIT and dependency/font notices are retained. See [distribution terms](LICENSE-DISTRIBUTION.md) and [GPLv3](COPYING.GPLv3). Use the release corresponding-source ZIP, including locked dependencies and ASIO build sources, for a complete offline build; GitHub automatic source archives do not include those additional build inputs.
+
+With Rust/Cargo 1.99, MSVC/Windows SDK and LLVM/libclang installed, extract that ZIP and run:
+
+```powershell
+.\scripts\build-corresponding-source.ps1 -TargetDirectory C:\Build\AudioVisualizer-beta2
+```
+
+Choose an ASCII target directory for ASIO. This command builds only; it does not start audio input or output. Run the resulting executable with `--demo` for a synthetic demonstration.
