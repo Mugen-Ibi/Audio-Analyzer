@@ -1,10 +1,15 @@
 #[cfg(feature = "audio-device")]
 pub mod audio;
 pub mod capture;
+pub mod config;
 pub mod controller;
 pub mod dsp;
+#[path = "ui/state.rs"]
+pub mod history;
 pub mod model;
 pub mod pipeline;
 pub mod source;
+pub mod synthetic;
 #[cfg(feature = "desktop")]
 pub mod ui;
+pub mod visualizer;

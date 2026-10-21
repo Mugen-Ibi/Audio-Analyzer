@@ -3,16 +3,21 @@ use std::sync::Arc;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::model::{
-    AnalysisSnapshot, AudioBlock, BinMetrics, FFT_SIZE, HOP_SIZE, SPECTRUM_BINS, SignalLevel,
-    StereoFrame, VECTOR_SCOPE_POINTS,
+    AnalysisSnapshot, AudioBlock, BinMetrics, BinStorage, SignalLevel, StereoFrame,
+    VECTOR_SCOPE_POINTS,
 };
 
-const AVERAGING_ALPHA: f32 = 0.2;
+use crate::config::{AnalysisConfig, WindowFunction};
 const MIN_DB: f32 = -120.0;
 const POWER_EPSILON: f32 = 1.0e-20;
 
 pub struct SpectrumAnalyzer {
     sample_rate: u32,
+    config: AnalysisConfig,
+    output_pool: Vec<BinStorage>,
+    skipped_results: u64,
+    averaged_windows: u32,
+    invalid_samples: u32,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     coherent_gain: f32,
@@ -32,35 +37,52 @@ pub struct SpectrumAnalyzer {
 
 impl SpectrumAnalyzer {
     pub fn new(sample_rate: u32) -> Self {
+        Self::with_config(sample_rate, AnalysisConfig::default()).expect("valid default")
+    }
+
+    pub fn with_config(sample_rate: u32, config: AnalysisConfig) -> Result<Self, String> {
+        config.validate()?;
+        if sample_rate == 0 {
+            return Err("sample rate must be nonzero".into());
+        }
+        let size = config.fft_size;
+        let bins = size / 2 + 1;
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let window: Vec<f32> = (0..FFT_SIZE)
-            .map(|index| {
-                0.5 * (1.0
-                    - (2.0 * std::f32::consts::PI * index as f32 / (FFT_SIZE - 1) as f32).cos())
+        let fft = planner.plan_fft_forward(size);
+        let window: Vec<f32> = (0..size)
+            .map(|index| match config.window {
+                WindowFunction::Hann => {
+                    0.5 * (1.0
+                        - (2.0 * std::f32::consts::PI * index as f32 / (size - 1) as f32).cos())
+                }
+                WindowFunction::Rectangular => 1.0,
             })
             .collect();
-        let coherent_gain = window.iter().sum::<f32>() / FFT_SIZE as f32;
+        let coherent_gain = window.iter().sum::<f32>() / size as f32;
         let fft_scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
-
-        Self {
+        Ok(Self {
             sample_rate,
+            config,
+            output_pool: (0..8).map(|_| BinStorage::default()).collect(),
+            skipped_results: 0,
+            averaged_windows: 0,
+            invalid_samples: 0,
             fft_scratch,
             fft,
             window,
             coherent_gain,
-            samples: Vec::with_capacity(FFT_SIZE),
-            reference_fft: vec![Complex::default(); FFT_SIZE],
-            measurement_fft: vec![Complex::default(); FFT_SIZE],
-            averaged_reference_power: vec![0.0; SPECTRUM_BINS],
-            averaged_measurement_power: vec![0.0; SPECTRUM_BINS],
-            averaged_cross_power: vec![Complex::default(); SPECTRUM_BINS],
+            samples: Vec::with_capacity(size),
+            reference_fft: vec![Complex::default(); size],
+            measurement_fft: vec![Complex::default(); size],
+            averaged_reference_power: vec![0.0; bins],
+            averaged_measurement_power: vec![0.0; bins],
+            averaged_cross_power: vec![Complex::default(); bins],
             averaging_initialized: false,
             expected_input_frame: None,
             window_start_frame: 0,
             route_generation: None,
             sequence: 0,
-        }
+        })
     }
 
     pub fn process_block(&mut self, block: &AudioBlock) -> Option<AnalysisSnapshot> {
@@ -78,6 +100,19 @@ impl SpectrumAnalyzer {
         self.route_generation = Some(block.route_generation);
         self.expected_input_frame = Some(block.start_frame + block.valid_frames as u64);
 
+        let invalid = block.frames[..block.valid_frames]
+            .iter()
+            .filter(|f| {
+                !f.measurement.is_finite()
+                    || f.measurement.abs() > 16.0
+                    || (block.has_reference
+                        && (!f.reference.is_finite() || f.reference.abs() > 16.0))
+            })
+            .count();
+        if invalid > 0 {
+            self.reset_history();
+            self.invalid_samples = invalid as u32;
+        }
         let mut newest = None;
         for (offset, frame) in block.frames[..block.valid_frames].iter().enumerate() {
             if self.samples.is_empty() {
@@ -88,11 +123,16 @@ impl SpectrumAnalyzer {
                 measurement: finite_sample(frame.measurement),
             });
 
-            if self.samples.len() == FFT_SIZE {
-                newest = Some(self.analyze(block.has_reference));
-                self.samples.copy_within(HOP_SIZE..FFT_SIZE, 0);
-                self.samples.truncate(FFT_SIZE - HOP_SIZE);
-                self.window_start_frame += HOP_SIZE as u64;
+            if self.samples.len() == self.config.fft_size {
+                newest = self.analyze(block.has_reference);
+                self.samples
+                    .copy_within(self.config.hop()..self.config.fft_size, 0);
+                self.samples
+                    .truncate(self.config.fft_size - self.config.hop());
+                self.window_start_frame += self.config.hop() as u64;
+                if self.invalid_samples > 0 {
+                    self.reset_history();
+                }
             }
         }
         newest
@@ -100,6 +140,8 @@ impl SpectrumAnalyzer {
 
     pub fn reset_history(&mut self) {
         self.samples.clear();
+        self.averaged_windows = 0;
+        self.invalid_samples = 0;
         self.averaging_initialized = false;
         self.expected_input_frame = None;
         self.averaged_reference_power.fill(0.0);
@@ -107,8 +149,33 @@ impl SpectrumAnalyzer {
         self.averaged_cross_power.fill(Complex::default());
     }
 
-    fn analyze(&mut self, has_reference: bool) -> AnalysisSnapshot {
-        for index in 0..FFT_SIZE {
+    pub fn skipped_results(&self) -> u64 {
+        self.skipped_results
+    }
+    fn analyze(&mut self, has_reference: bool) -> Option<AnalysisSnapshot> {
+        let measurement_clipped = self.samples.iter().any(|f| f.measurement.abs() >= 1.0);
+        let reference_clipped =
+            has_reference && self.samples.iter().any(|f| f.reference.abs() >= 1.0);
+        if measurement_clipped || reference_clipped {
+            self.averaging_initialized = false;
+            self.averaged_windows = 0;
+        }
+        let Some(slot) = self.output_pool.iter().position(BinStorage::available) else {
+            self.skipped_results += 1;
+            self.sequence = self.sequence.wrapping_add(1);
+            return None;
+        };
+        let size = self.config.fft_size;
+        let bins = size / 2 + 1;
+        let alpha = if self.config.averaging_ms == 0 {
+            1.0
+        } else {
+            1.0 - (-(self.config.hop() as f32)
+                / (self.sample_rate as f32 * self.config.averaging_ms as f32 / 1000.0))
+                .exp()
+        };
+        self.averaged_windows = self.averaged_windows.saturating_add(1);
+        for index in 0..size {
             let frame = self.samples[index];
             let window = self.window[index];
             self.reference_fft[index] = Complex::new(frame.reference * window, 0.0);
@@ -120,40 +187,7 @@ impl SpectrumAnalyzer {
         self.fft
             .process_with_scratch(&mut self.measurement_fft, &mut self.fft_scratch);
 
-        let mut snapshot = AnalysisSnapshot {
-            route_generation: self.route_generation.unwrap_or(0),
-            sequence: self.sequence,
-            window_start_frame: self.window_start_frame,
-            sample_rate: self.sample_rate,
-            has_reference,
-            measurement_level: signal_level(self.samples.iter().map(|frame| frame.measurement)),
-            reference_level: has_reference
-                .then(|| signal_level(self.samples.iter().map(|frame| frame.reference))),
-            phase_correlation: has_reference.then(|| phase_correlation(&self.samples)),
-            ..AnalysisSnapshot::default()
-        };
-        self.sequence = self.sequence.wrapping_add(1);
-
-        if has_reference {
-            // Preserve a representative pair per bucket. Fixed-stride sampling
-            // aliases tones whose period divides the stride to a single point.
-            for (scope_index, bucket) in self
-                .samples
-                .chunks(FFT_SIZE / VECTOR_SCOPE_POINTS)
-                .enumerate()
-            {
-                snapshot.scope_points[scope_index] = *bucket
-                    .iter()
-                    .max_by(|a, b| {
-                        (a.reference.abs().max(a.measurement.abs()))
-                            .total_cmp(&b.reference.abs().max(b.measurement.abs()))
-                    })
-                    .expect("scope buckets are nonempty");
-                snapshot.scope_len += 1;
-            }
-        }
-
-        for bin in 0..SPECTRUM_BINS {
+        for bin in 0..bins {
             let reference = self.reference_fft[bin];
             let measurement = self.measurement_fft[bin];
             let reference_power = reference.norm_sqr();
@@ -166,22 +200,25 @@ impl SpectrumAnalyzer {
                 self.averaged_cross_power[bin] = cross_power;
             } else {
                 self.averaged_reference_power[bin] =
-                    blend(self.averaged_reference_power[bin], reference_power);
-                self.averaged_measurement_power[bin] =
-                    blend(self.averaged_measurement_power[bin], measurement_power);
+                    blend(self.averaged_reference_power[bin], reference_power, alpha);
+                self.averaged_measurement_power[bin] = blend(
+                    self.averaged_measurement_power[bin],
+                    measurement_power,
+                    alpha,
+                );
                 self.averaged_cross_power[bin] =
-                    blend_complex(self.averaged_cross_power[bin], cross_power);
+                    blend_complex(self.averaged_cross_power[bin], cross_power, alpha);
             }
 
-            let one_sided_factor = if bin == 0 || bin == FFT_SIZE / 2 {
+            let one_sided_factor = if bin == 0 || bin == size / 2 {
                 1.0
             } else {
                 2.0
             };
-            let reference_amplitude =
-                reference.norm() * one_sided_factor / (FFT_SIZE as f32 * self.coherent_gain);
-            let amplitude =
-                measurement.norm() * one_sided_factor / (FFT_SIZE as f32 * self.coherent_gain);
+            let reference_amplitude = self.averaged_reference_power[bin].sqrt() * one_sided_factor
+                / (size as f32 * self.coherent_gain);
+            let amplitude = self.averaged_measurement_power[bin].sqrt() * one_sided_factor
+                / (size as f32 * self.coherent_gain);
             let measurement_dbfs = amplitude_to_db(amplitude);
 
             let mut metrics = BinMetrics {
@@ -203,23 +240,77 @@ impl SpectrumAnalyzer {
                         (self.averaged_cross_power[bin].norm_sqr() / denominator).clamp(0.0, 1.0);
                 }
             }
-            snapshot.bins[bin] = metrics;
+            self.output_pool[slot][bin] = metrics;
         }
         self.averaging_initialized = true;
-        snapshot
+        let mut snapshot = AnalysisSnapshot {
+            config: self.config,
+            bin_count: bins,
+            invalid_samples: self.invalid_samples,
+            averaged_windows: self.averaged_windows,
+            measurement_clipped,
+            reference_clipped,
+            route_generation: self.route_generation.unwrap_or(0),
+            sequence: self.sequence,
+            window_start_frame: self.window_start_frame,
+            sample_rate: self.sample_rate,
+            has_reference,
+            measurement_level: signal_level(self.samples.iter().map(|frame| frame.measurement)),
+            reference_level: has_reference
+                .then(|| signal_level(self.samples.iter().map(|frame| frame.reference))),
+            phase_correlation: has_reference.then(|| phase_correlation(&self.samples)),
+            ..AnalysisSnapshot::with_bins(self.output_pool[slot].clone())
+        };
+        snapshot.comparison_ready = has_reference
+            && self.invalid_samples == 0
+            && !measurement_clipped
+            && !reference_clipped
+            && self.averaged_windows >= 8
+            && self.config.averaging_ms > 0
+            && snapshot.measurement_level.rms_dbfs > -100.0
+            && snapshot
+                .reference_level
+                .is_some_and(|l| l.rms_dbfs > -100.0);
+        self.sequence = self.sequence.wrapping_add(1);
+
+        if has_reference {
+            // Preserve a representative pair per bucket. Fixed-stride sampling
+            // aliases tones whose period divides the stride to a single point.
+            for (scope_index, bucket) in self.samples.chunks(size / VECTOR_SCOPE_POINTS).enumerate()
+            {
+                snapshot.scope_points[scope_index] = *bucket
+                    .iter()
+                    .max_by(|a, b| {
+                        (a.reference.abs().max(a.measurement.abs()))
+                            .total_cmp(&b.reference.abs().max(b.measurement.abs()))
+                    })
+                    .expect("scope buckets are nonempty");
+                snapshot.scope_len += 1;
+            }
+        }
+
+        if measurement_clipped || reference_clipped {
+            self.averaging_initialized = false;
+            self.averaged_windows = 0;
+        }
+        Some(snapshot)
     }
 }
 
 fn finite_sample(sample: f32) -> f32 {
-    if sample.is_finite() { sample } else { 0.0 }
+    if sample.is_finite() {
+        sample.clamp(-16.0, 16.0)
+    } else {
+        0.0
+    }
 }
 
-fn blend(previous: f32, current: f32) -> f32 {
-    previous + AVERAGING_ALPHA * (current - previous)
+fn blend(previous: f32, current: f32, alpha: f32) -> f32 {
+    previous + alpha * (current - previous)
 }
 
-fn blend_complex(previous: Complex<f32>, current: Complex<f32>) -> Complex<f32> {
-    previous + (current - previous) * AVERAGING_ALPHA
+fn blend_complex(previous: Complex<f32>, current: Complex<f32>, alpha: f32) -> Complex<f32> {
+    previous + (current - previous) * alpha
 }
 
 fn amplitude_to_db(amplitude: f32) -> f32 {
@@ -266,7 +357,7 @@ fn phase_correlation(samples: &[StereoFrame]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AUDIO_BLOCK_FRAMES, AudioBlock, StereoFrame};
+    use crate::model::{AUDIO_BLOCK_FRAMES, AudioBlock, FFT_SIZE, HOP_SIZE, StereoFrame};
 
     #[test]
     fn non_finite_samples_do_not_poison_fft_or_averages() {
@@ -275,7 +366,7 @@ mod tests {
             |i| if i == 10 { f32::NAN } else { 0.5 },
             |i| if i == 20 { f32::INFINITY } else { 0.25 },
         );
-        for bin in snapshot.bins {
+        for bin in snapshot.bins.iter() {
             assert!(bin.measurement_dbfs.is_finite());
             assert!(bin.transfer_db.is_finite());
             assert!(bin.phase_degrees.is_finite());

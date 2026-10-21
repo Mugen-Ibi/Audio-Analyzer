@@ -44,7 +44,7 @@ fn wait_for_snapshot(runtime: &mut AnalyzerController) -> AnalysisSnapshot {
 #[test]
 #[ignore = "requires a working input device; opens the default microphone"]
 fn live_input_route_switch_and_shutdown() {
-    let mut runtime = AnalyzerController::with_source(CpalSource).unwrap();
+    let mut runtime = AnalyzerController::with_source(CpalSource::default()).unwrap();
     runtime.start().unwrap();
     let initial = wait_for_snapshot(&mut runtime);
     println!("Input: {:?}", runtime.info().unwrap());

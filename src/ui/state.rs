@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
 
-use crate::model::{AnalysisSnapshot, FFT_SIZE, SPECTRUM_BINS};
+use crate::model::AnalysisSnapshot;
 
 const HISTORY_HZ: u64 = 10;
-const HISTORY_CAPACITY: usize = 3_000;
+const HISTORY_CAPACITY: usize = 6_001;
 pub const HISTORY_SPECTRUM_BANDS: usize = 96;
-pub const HISTORY_SECONDS: f64 = 300.0;
+pub const HISTORY_SECONDS: f64 = 600.0;
 pub const DEFAULT_NO_SIGNAL_THRESHOLD_DBFS: f32 = -90.0;
 
 const SIGNAL_HYSTERESIS_DB: f32 = 6.0;
 const SIGNAL_RELEASE_SECONDS: f64 = 0.5;
-const HISTORY_ZOOM_LEVELS: [f64; 5] = [300.0, 120.0, 60.0, 30.0, 10.0];
+const HISTORY_ZOOM_LEVELS: [f64; 6] = [600.0, 300.0, 120.0, 60.0, 30.0, 10.0];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SignalGate {
@@ -194,88 +194,230 @@ impl PeakHold {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HistoryPoint {
+    pub measurement_clipped: bool,
+    pub reference_clipped: bool,
     pub seconds: f64,
     pub measurement_rms: f32,
     pub reference_rms: Option<f32>,
     pub spectrum_dbfs: [f32; HISTORY_SPECTRUM_BANDS],
     pub gap: bool,
+    pub reference_spectrum_dbfs: Option<[f32; HISTORY_SPECTRUM_BANDS]>,
+    pub segment: u64,
+    pub config: crate::config::AnalysisConfig,
+    pub sample_rate: u32,
 }
 
-#[derive(Default)]
+/// Match the cursor and renderer to the same measured interval. Small timing
+/// variations from FFT hops are continuous; missing/changed conditions never are.
+pub fn history_interval_end(point: &HistoryPoint, next: Option<&HistoryPoint>) -> f64 {
+    if point.gap {
+        return point.seconds;
+    }
+    if let Some(next) = next
+        && !next.gap
+        && next.segment == point.segment
+        && next.seconds > point.seconds
+        && next.seconds - point.seconds <= history_max_spacing(point.config, point.sample_rate)
+    {
+        return next.seconds;
+    }
+    point.seconds + 0.1
+}
+
+fn history_max_spacing(config: crate::config::AnalysisConfig, sample_rate: u32) -> f64 {
+    // The first available FFT after the 10 Hz deadline can be one hop later.
+    // In precise mode a legitimate record interval can therefore exceed 150 ms.
+    0.1 + config.hop() as f64 / sample_rate.max(1) as f64 + 1e-6
+}
+
 pub struct HistoryBuffer {
     points: VecDeque<HistoryPoint>,
     last_frame: Option<u64>,
     last_discontinuities: u64,
+    retention_seconds: f64,
+    segment: u64,
+    boundary: bool,
+    labels: VecDeque<(u64, String)>,
 }
 
-impl HistoryBuffer {
-    pub fn push(&mut self, snapshot: &AnalysisSnapshot, discontinuities: u64) -> bool {
-        if snapshot.sample_rate == 0 {
-            return false;
+impl Default for HistoryBuffer {
+    fn default() -> Self {
+        Self {
+            points: VecDeque::new(),
+            last_frame: None,
+            last_discontinuities: 0,
+            retention_seconds: 600.0,
+            segment: 0,
+            boundary: false,
+            labels: VecDeque::new(),
         }
+    }
+}
+impl HistoryBuffer {
+    pub fn begin_segment(&mut self, label: String) {
+        // A slider can change conditions repeatedly before one complete window
+        // arrives. Such empty segments must not evict metadata for real results.
+        if self.boundary {
+            self.labels.pop_back();
+        }
+        self.segment = self.segment.wrapping_add(1);
+        self.labels.push_back((self.segment, label));
+        while self.labels.len() > HISTORY_CAPACITY {
+            self.labels.pop_front();
+        }
+        self.last_frame = None;
+        self.last_discontinuities = 0;
+        self.boundary = true;
+    }
+    pub fn label(&self, segment: u64) -> &str {
+        self.labels
+            .iter()
+            .find(|(id, _)| *id == segment)
+            .map_or("条件不明（保持範囲外）", |(_, s)| s.as_str())
+    }
+    pub fn set_retention(&mut self, seconds: u32) {
+        self.retention_seconds = seconds.clamp(60, 600) as f64;
+    }
+    pub fn expire(&mut self, now: f64) {
+        while self
+            .points
+            .front()
+            .is_some_and(|p| p.seconds < now - self.retention_seconds)
+        {
+            self.points.pop_front();
+        }
+        while self.labels.len() > 1
+            && self
+                .points
+                .front()
+                .is_none_or(|p| self.labels[1].0 <= p.segment)
+        {
+            self.labels.pop_front();
+        }
+    }
+    pub fn push(&mut self, snapshot: &AnalysisSnapshot, discontinuities: u64) -> bool {
         if self
             .last_frame
             .is_some_and(|last| snapshot.window_start_frame < last)
         {
             self.clear();
         }
+        let seconds = snapshot.window_start_frame as f64 / snapshot.sample_rate.max(1) as f64;
+        self.push_at(snapshot, discontinuities, seconds)
+    }
+    pub fn push_at(
+        &mut self,
+        snapshot: &AnalysisSnapshot,
+        discontinuities: u64,
+        seconds: f64,
+    ) -> bool {
+        if snapshot.sample_rate == 0 || !seconds.is_finite() {
+            return false;
+        }
         let interval = (snapshot.sample_rate as u64 / HISTORY_HZ).max(1);
-        if self
-            .last_frame
-            .is_some_and(|last| snapshot.window_start_frame.saturating_sub(last) < interval)
+        let discontinuity = discontinuities != self.last_discontinuities;
+        let clip_changed = self.points.back().is_some_and(|point| {
+            point.measurement_clipped != snapshot.measurement_clipped
+                || point.reference_clipped != snapshot.reference_clipped
+        });
+        if !discontinuity
+            && !clip_changed
+            && !self.boundary
+            && snapshot.invalid_samples == 0
+            && self
+                .last_frame
+                .is_some_and(|last| snapshot.window_start_frame.saturating_sub(last) < interval)
         {
             return false;
         }
-        let gap = discontinuities != self.last_discontinuities;
+        let gap = self.boundary
+            || discontinuity
+            || snapshot.invalid_samples > 0
+            || self.points.back().is_some_and(|last| {
+                seconds - last.seconds > history_max_spacing(snapshot.config, snapshot.sample_rate)
+            });
         self.points.push_back(HistoryPoint {
-            seconds: snapshot.window_start_frame as f64 / snapshot.sample_rate as f64,
+            measurement_clipped: snapshot.measurement_clipped,
+            reference_clipped: snapshot.reference_clipped,
+            seconds,
             measurement_rms: snapshot.measurement_level.rms_dbfs,
-            reference_rms: snapshot.reference_level.map(|level| level.rms_dbfs),
-            spectrum_dbfs: history_spectrum(snapshot),
+            reference_rms: snapshot.reference_level.map(|l| l.rms_dbfs),
+            spectrum_dbfs: history_spectrum(snapshot, false),
+            reference_spectrum_dbfs: snapshot
+                .has_reference
+                .then(|| history_spectrum(snapshot, true)),
             gap,
+            segment: self.segment,
+            config: snapshot.config,
+            sample_rate: snapshot.sample_rate,
         });
         self.last_frame = Some(snapshot.window_start_frame);
         self.last_discontinuities = discontinuities;
+        self.boundary = false;
+        self.expire(seconds);
         while self.points.len() > HISTORY_CAPACITY {
             self.points.pop_front();
         }
         true
     }
-
     pub fn clear(&mut self) {
-        self.points.clear();
-        self.last_frame = None;
-        self.last_discontinuities = 0;
+        *self = Self {
+            retention_seconds: self.retention_seconds,
+            ..Self::default()
+        };
     }
-
     pub fn points(&self) -> &VecDeque<HistoryPoint> {
         &self.points
     }
+    pub fn at(&self, seconds: f64) -> Option<&HistoryPoint> {
+        self.points
+            .iter()
+            .enumerate()
+            .find(|(index, p)| {
+                !p.gap
+                    && p.seconds <= seconds
+                    && seconds < history_interval_end(p, self.points.get(index + 1))
+            })
+            .map(|(_, p)| p)
+    }
 }
 
-fn history_spectrum(snapshot: &AnalysisSnapshot) -> [f32; HISTORY_SPECTRUM_BANDS] {
+pub fn history_spectrum(
+    snapshot: &AnalysisSnapshot,
+    reference: bool,
+) -> [f32; HISTORY_SPECTRUM_BANDS] {
     let mut levels = [-120.0; HISTORY_SPECTRUM_BANDS];
     if snapshot.sample_rate == 0 {
         return levels;
     }
 
     let min_frequency = 20.0_f32;
-    let nyquist = snapshot.sample_rate as f32 * 0.5;
-    let resolution = snapshot.sample_rate as f32 / FFT_SIZE as f32;
+    let nyquist = 20_000.0_f32;
+    let resolution = snapshot.sample_rate as f32 / snapshot.config.fft_size as f32;
     let log_span = (nyquist / min_frequency).ln();
     if log_span <= 0.0 {
         return levels;
     }
-    for (bin, metrics) in snapshot.bins.iter().enumerate().take(SPECTRUM_BINS).skip(1) {
+    for (bin, metrics) in snapshot
+        .bins
+        .iter()
+        .enumerate()
+        .take(snapshot.bin_count)
+        .skip(1)
+    {
         let frequency = bin as f32 * resolution;
-        if frequency < min_frequency {
+        if frequency < min_frequency || frequency > nyquist {
             continue;
         }
         let band = ((frequency / min_frequency).ln() / log_span
             * (HISTORY_SPECTRUM_BANDS - 1) as f32)
             .round() as usize;
         let level = &mut levels[band.min(HISTORY_SPECTRUM_BANDS - 1)];
-        *level = level.max(metrics.measurement_dbfs);
+        *level = level.max(if reference {
+            metrics.reference_dbfs
+        } else {
+            metrics.measurement_dbfs
+        });
     }
     levels
 }
@@ -283,7 +425,7 @@ fn history_spectrum(snapshot: &AnalysisSnapshot) -> [f32; HISTORY_SPECTRUM_BANDS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnalysisSnapshot, SignalLevel};
+    use crate::model::{AnalysisSnapshot, FFT_SIZE, SPECTRUM_BINS, SignalLevel};
 
     fn snapshot(frame: u64) -> AnalysisSnapshot {
         AnalysisSnapshot {
@@ -301,14 +443,19 @@ mod tests {
     fn history_keeps_every_audible_fft_bin_peak() {
         for rate in [48_000, 96_000, 192_000] {
             for bin in 1..SPECTRUM_BINS {
+                if bin as f32 * rate as f32 / FFT_SIZE as f32 > 20_000.0 {
+                    continue;
+                }
                 let mut input = snapshot(0);
                 input.sample_rate = rate;
-                for metrics in &mut input.bins {
+                for metrics in input.bins.iter_mut() {
                     metrics.measurement_dbfs = -120.0;
                 }
                 input.bins[bin].measurement_dbfs = -3.0;
                 assert_eq!(
-                    history_spectrum(&input).into_iter().fold(-120.0, f32::max),
+                    history_spectrum(&input, false)
+                        .into_iter()
+                        .fold(-120.0, f32::max),
                     -3.0
                 );
             }
@@ -356,7 +503,7 @@ mod tests {
     #[test]
     fn history_records_log_spaced_frequency_levels() {
         let mut input = snapshot(0);
-        for metrics in &mut input.bins {
+        for metrics in input.bins.iter_mut() {
             metrics.measurement_dbfs = -120.0;
         }
         let band = HISTORY_SPECTRUM_BANDS / 2;
@@ -376,12 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn history_never_exceeds_three_thousand_points() {
+    fn history_records_fit_the_bounded_capacity() {
         let mut history = HistoryBuffer::default();
         for index in 0..3_100_u64 {
             history.push(&snapshot(index * 4_800), 0);
         }
-        assert_eq!(history.points().len(), HISTORY_CAPACITY);
+        assert!(history.points().len() <= HISTORY_CAPACITY);
     }
 
     #[test]
@@ -406,12 +553,12 @@ mod tests {
     #[test]
     fn history_viewport_zooms_and_pans_within_fixed_window() {
         let mut viewport = HistoryViewport::default();
-        assert_eq!(viewport.visible_seconds(), 30.0);
-        assert_eq!(viewport.time_bounds(100.0), (70.0, 100.0));
+        assert_eq!(viewport.visible_seconds(), 60.0);
+        assert_eq!(viewport.time_bounds(100.0), (40.0, 100.0));
         viewport.zoom_in();
-        assert_eq!(viewport.visible_seconds(), 10.0);
+        assert_eq!(viewport.visible_seconds(), 30.0);
         viewport.pan_older();
-        assert_eq!(viewport.time_bounds(100.0), (85.0, 95.0));
+        assert_eq!(viewport.time_bounds(100.0), (55.0, 85.0));
         viewport.jump_live();
         assert_eq!(viewport.offset_from_live(), 0.0);
     }

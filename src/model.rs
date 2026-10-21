@@ -4,6 +4,36 @@ pub const AUDIO_BLOCK_FRAMES: usize = 256;
 pub const FFT_SIZE: usize = 2048;
 pub const HOP_SIZE: usize = FFT_SIZE / 2;
 pub const SPECTRUM_BINS: usize = FFT_SIZE / 2 + 1;
+pub const MAX_FFT_SIZE: usize = 8192;
+pub const MAX_SPECTRUM_BINS: usize = MAX_FFT_SIZE / 2 + 1;
+
+/// Small snapshot handle. The DSP fills only uniquely owned preallocated slots;
+/// frozen/UI snapshots keep their slot immutable through Arc ownership.
+#[derive(Clone, Debug)]
+pub struct BinStorage(std::sync::Arc<[BinMetrics]>);
+impl Default for BinStorage {
+    fn default() -> Self {
+        Self(std::sync::Arc::from(
+            vec![BinMetrics::default(); MAX_SPECTRUM_BINS].into_boxed_slice(),
+        ))
+    }
+}
+impl BinStorage {
+    pub(crate) fn available(&self) -> bool {
+        std::sync::Arc::strong_count(&self.0) == 1
+    }
+}
+impl std::ops::Deref for BinStorage {
+    type Target = [BinMetrics];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for BinStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
 pub const VECTOR_SCOPE_POINTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,7 +69,7 @@ impl AudioBlock {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelRoute {
     pub reference: Option<usize>,
     pub measurement: usize,
@@ -76,6 +106,11 @@ impl ChannelRoute {
                 "Reference channel is outside the {channels} available channels"
             ));
         }
+        if self.reference == Some(self.measurement) {
+            return Err(
+                "comparison channels must be different; disable the green input for mono".into(),
+            );
+        }
         Ok(self)
     }
 }
@@ -97,7 +132,7 @@ impl RouteControl {
 
     pub fn store(&self, route: ChannelRoute) {
         self.packed_route
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
                 let (_, generation) = unpack_route(packed);
                 Some(pack_route(route, generation.wrapping_add(1)))
             })
@@ -128,11 +163,41 @@ fn unpack_route(packed: u64) -> (ChannelRoute, u64) {
 
 #[derive(Default)]
 pub struct RuntimeStats {
+    pub coalesced_results: AtomicU64,
+    pub invalid_samples: AtomicU64,
+    pub clipped_frames: AtomicU64,
+    pub callback_frames: AtomicU64,
+    pub callback_min_frames: AtomicU64,
+    pub callback_max_frames: AtomicU64,
+    pub latest_frame: AtomicU64,
     pub received_audio_frames: AtomicU64,
     pub dropped_audio_frames: AtomicU64,
     pub stream_errors: AtomicU64,
     pub discontinuities: AtomicU64,
     pub dropped_results: AtomicU64,
+}
+
+#[cfg(feature = "audio-device")]
+impl RuntimeStats {
+    /// Only between fully stopped startup attempts, before a new stream exists.
+    pub(crate) fn reset_startup_attempt(&self) {
+        for counter in [
+            &self.coalesced_results,
+            &self.invalid_samples,
+            &self.clipped_frames,
+            &self.callback_frames,
+            &self.callback_min_frames,
+            &self.callback_max_frames,
+            &self.latest_frame,
+            &self.received_audio_frames,
+            &self.dropped_audio_frames,
+            &self.stream_errors,
+            &self.discontinuities,
+            &self.dropped_results,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -159,8 +224,21 @@ impl Default for SignalLevel {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AnalysisSnapshot {
+    /// Input continuity counter captured with this result, not sampled later by UI.
+    pub discontinuity_id: u64,
+    /// Capture progress at processing completion, relative to this window end.
+    pub queue_lag_frames: u64,
+    pub analysis_generation: u64,
+    pub config: crate::config::AnalysisConfig,
+    pub bin_count: usize,
+    pub processed_at: std::time::Instant,
+    pub invalid_samples: u32,
+    pub measurement_clipped: bool,
+    pub reference_clipped: bool,
+    pub averaged_windows: u32,
+    pub comparison_ready: bool,
     pub route_generation: u64,
     pub sequence: u64,
     pub window_start_frame: u64,
@@ -171,12 +249,28 @@ pub struct AnalysisSnapshot {
     pub phase_correlation: Option<f32>,
     pub scope_points: [StereoFrame; VECTOR_SCOPE_POINTS],
     pub scope_len: usize,
-    pub bins: [BinMetrics; SPECTRUM_BINS],
+    pub bins: BinStorage,
 }
 
 impl Default for AnalysisSnapshot {
     fn default() -> Self {
+        Self::with_bins(BinStorage::default())
+    }
+}
+impl AnalysisSnapshot {
+    pub(crate) fn with_bins(bins: BinStorage) -> Self {
         Self {
+            discontinuity_id: 0,
+            queue_lag_frames: 0,
+            analysis_generation: 0,
+            config: crate::config::AnalysisConfig::default(),
+            bin_count: SPECTRUM_BINS,
+            processed_at: std::time::Instant::now(),
+            invalid_samples: 0,
+            measurement_clipped: false,
+            reference_clipped: false,
+            averaged_windows: 0,
+            comparison_ready: false,
             route_generation: 0,
             sequence: 0,
             window_start_frame: 0,
@@ -187,7 +281,7 @@ impl Default for AnalysisSnapshot {
             phase_correlation: None,
             scope_points: [StereoFrame::default(); VECTOR_SCOPE_POINTS],
             scope_len: 0,
-            bins: [BinMetrics::default(); SPECTRUM_BINS],
+            bins,
         }
     }
 }

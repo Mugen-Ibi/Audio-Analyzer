@@ -13,6 +13,7 @@ use ringbuf::{
 };
 
 use crate::{
+    config::{AnalysisConfig, AnalysisControl},
     dsp::SpectrumAnalyzer,
     model::{AnalysisSnapshot, AudioBlock, ChannelRoute, RouteControl, RuntimeStats},
     source::{AudioInfo, InputSource, OpenedSource},
@@ -26,18 +27,31 @@ pub struct AnalyzerRuntime {
     reader: Option<AnalysisReader>,
     route_control: Arc<RouteControl>,
     stats: Arc<RuntimeStats>,
+    analysis_control: Arc<AnalysisControl>,
 }
 
 impl AnalyzerRuntime {
     #[cfg(feature = "audio-device")]
     pub fn start() -> Result<Self, String> {
-        Self::start_with(&mut crate::audio::CpalSource, &AtomicBool::new(false))
+        Self::start_with(
+            &mut crate::audio::CpalSource::default(),
+            &AtomicBool::new(false),
+        )
     }
 
     pub fn start_with(
         source: &mut dyn InputSource,
         cancelled: &AtomicBool,
     ) -> Result<Self, String> {
+        Self::start_configured(source, cancelled, AnalysisConfig::default())
+    }
+
+    pub fn start_configured(
+        source: &mut dyn InputSource,
+        cancelled: &AtomicBool,
+        config: AnalysisConfig,
+    ) -> Result<Self, String> {
+        config.validate()?;
         if cancelled.load(Ordering::Acquire) {
             return Err("input start cancelled".to_owned());
         }
@@ -51,11 +65,13 @@ impl AnalyzerRuntime {
         let route_control = input.route_control;
         let result_ring = HeapRb::<AnalysisSnapshot>::new(RESULT_QUEUE_CAPACITY);
         let (result_producer, result_consumer) = result_ring.split();
+        let analysis_control = Arc::new(AnalysisControl::new(config));
         let dsp = DspWorker::spawn(
             input.consumer,
             result_producer,
             audio.info().sample_rate,
             Arc::clone(&stats),
+            Arc::clone(&analysis_control),
         )?;
 
         let channels = audio.info().channels;
@@ -66,9 +82,12 @@ impl AnalyzerRuntime {
                 result_consumer,
                 route_control: Arc::clone(&route_control),
                 channels,
+                analysis_control: Arc::clone(&analysis_control),
+                stats: Arc::clone(&stats),
             }),
             route_control,
             stats,
+            analysis_control,
         })
     }
 
@@ -84,6 +103,10 @@ impl AnalyzerRuntime {
         self.route_control
             .store(route.validate(self.info().channels)?);
         Ok(())
+    }
+
+    pub fn set_analysis(&self, config: AnalysisConfig) -> Result<(), String> {
+        self.analysis_control.store(config)
     }
 
     pub fn take_latest(&mut self) -> Option<AnalysisSnapshot> {
@@ -103,6 +126,8 @@ impl AnalyzerRuntime {
 
 /// Single-owner result endpoint; independent of the thread-bound device stream.
 pub struct AnalysisReader {
+    stats: Arc<RuntimeStats>,
+    analysis_control: Arc<AnalysisControl>,
     result_consumer: HeapCons<AnalysisSnapshot>,
     route_control: Arc<RouteControl>,
     channels: usize,
@@ -110,7 +135,16 @@ pub struct AnalysisReader {
 
 impl AnalysisReader {
     pub fn take_latest(&mut self) -> Option<AnalysisSnapshot> {
-        take_latest_matching(&mut self.result_consumer, self.route_control.load().1)
+        let (latest, coalesced) =
+            take_latest_matching(&mut self.result_consumer, self.route_control.load().1);
+        self.stats
+            .coalesced_results
+            .fetch_add(coalesced, Ordering::Relaxed);
+        latest.filter(|s| s.analysis_generation == self.analysis_control.load().1)
+    }
+
+    pub fn set_analysis(&self, config: AnalysisConfig) -> Result<(), String> {
+        self.analysis_control.store(config)
     }
 
     pub fn set_route(&self, route: ChannelRoute) -> Result<(), String> {
@@ -122,18 +156,19 @@ impl AnalysisReader {
 fn take_latest_matching(
     consumer: &mut HeapCons<AnalysisSnapshot>,
     generation: u64,
-) -> Option<AnalysisSnapshot> {
+) -> (Option<AnalysisSnapshot>, u64) {
     let mut latest = None;
+    let mut coalesced = 0;
     // Bound work to what was available at entry even if DSP keeps publishing.
     for _ in 0..consumer.occupied_len() {
         let Some(snapshot) = consumer.try_pop() else {
             break;
         };
-        if snapshot.route_generation == generation {
-            latest = Some(snapshot);
+        if snapshot.route_generation == generation && latest.replace(snapshot).is_some() {
+            coalesced += 1;
         }
     }
-    latest
+    (latest, coalesced)
 }
 
 impl Drop for AnalyzerRuntime {
@@ -154,13 +189,16 @@ impl DspWorker {
         mut result_producer: HeapProd<AnalysisSnapshot>,
         sample_rate: u32,
         stats: Arc<RuntimeStats>,
+        analysis_control: Arc<AnalysisControl>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("audio-analyzer-dsp".to_owned())
             .spawn(move || {
-                let mut analyzer = SpectrumAnalyzer::new(sample_rate);
+                let (config, mut analysis_generation) = analysis_control.load();
+                let mut analyzer = SpectrumAnalyzer::with_config(sample_rate, config)
+                    .expect("validated configuration");
                 let mut expected_frame = None;
                 let mut route_generation = None;
                 let mut pending = None;
@@ -171,6 +209,13 @@ impl DspWorker {
                         && let Some(block) = audio_consumer.try_pop()
                     {
                         did_work = true;
+                        let (config, generation) = analysis_control.load();
+                        if generation != analysis_generation {
+                            analyzer = SpectrumAnalyzer::with_config(sample_rate, config)
+                                .expect("validated configuration");
+                            analysis_generation = generation;
+                            pending = None;
+                        }
                         let frame_gap =
                             expected_frame.is_some_and(|expected| expected != block.start_frame);
                         let route_changed = route_generation
@@ -181,11 +226,24 @@ impl DspWorker {
                         expected_frame = Some(block.start_frame + block.valid_frames as u64);
                         route_generation = Some(block.route_generation);
 
-                        if let Some(snapshot) = analyzer.process_block(&block)
-                            && pending.replace(snapshot).is_some()
-                        {
-                            stats.dropped_results.fetch_add(1, Ordering::Relaxed);
+                        let skipped_before = analyzer.skipped_results();
+                        if let Some(mut snapshot) = analyzer.process_block(&block) {
+                            snapshot.discontinuity_id =
+                                stats.discontinuities.load(Ordering::Relaxed);
+                            snapshot.queue_lag_frames =
+                                stats.latest_frame.load(Ordering::Acquire).saturating_sub(
+                                    snapshot.window_start_frame + snapshot.config.fft_size as u64,
+                                );
+                            snapshot.processed_at = std::time::Instant::now();
+                            snapshot.analysis_generation = analysis_generation;
+                            if pending.replace(snapshot).is_some() {
+                                stats.dropped_results.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                        stats.dropped_results.fetch_add(
+                            analyzer.skipped_results() - skipped_before,
+                            Ordering::Relaxed,
+                        );
                         publish_pending(&mut result_producer, &mut pending);
                     }
                     publish_pending(&mut result_producer, &mut pending);
@@ -232,7 +290,7 @@ mod tests {
     fn route_switch_filters_queued_old_results() {
         let (mut producer, mut consumer) = HeapRb::new(3).split();
         producer.try_push(AnalysisSnapshot::default()).unwrap();
-        assert!(take_latest_matching(&mut consumer, 1).is_none());
+        assert!(take_latest_matching(&mut consumer, 1).0.is_none());
         for sequence in 1..=3 {
             producer
                 .try_push(AnalysisSnapshot {
@@ -242,7 +300,9 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(take_latest_matching(&mut consumer, 1).unwrap().sequence, 3);
+        let (latest, coalesced) = take_latest_matching(&mut consumer, 1);
+        assert_eq!(latest.unwrap().sequence, 3);
+        assert_eq!(coalesced, 2);
     }
 
     #[test]
@@ -265,8 +325,14 @@ mod tests {
     fn worker_processes_audio_and_stops() {
         let (mut producer, consumer) = HeapRb::new(16).split();
         let (results, mut snapshots) = HeapRb::new(3).split();
-        let mut worker =
-            DspWorker::spawn(consumer, results, 48_000, Arc::new(RuntimeStats::default())).unwrap();
+        let mut worker = DspWorker::spawn(
+            consumer,
+            results,
+            48_000,
+            Arc::new(RuntimeStats::default()),
+            Arc::new(AnalysisControl::new(AnalysisConfig::default())),
+        )
+        .unwrap();
         for index in 0..8 {
             producer
                 .try_push(AudioBlock {
@@ -290,5 +356,42 @@ mod tests {
         }
         worker.stop();
         assert!(worker.handle.is_none());
+    }
+
+    #[test]
+    fn queued_results_keep_their_own_input_gap_boundary() {
+        let (mut producer, consumer) = HeapRb::new(16).split();
+        let (results, mut snapshots) = HeapRb::new(3).split();
+        let stats = Arc::new(RuntimeStats::default());
+        let mut worker = DspWorker::spawn(
+            consumer,
+            results,
+            48000,
+            Arc::clone(&stats),
+            Arc::new(AnalysisControl::new(AnalysisConfig::default())),
+        )
+        .unwrap();
+        for index in 0..16 {
+            producer
+                .try_push(AudioBlock {
+                    start_frame: (index + if index >= 8 { 10 } else { 0 })
+                        * crate::model::AUDIO_BLOCK_FRAMES as u64,
+                    valid_frames: crate::model::AUDIO_BLOCK_FRAMES,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while snapshots.occupied_len() < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(stats.discontinuities.load(Ordering::Relaxed), 1);
+        let before = snapshots.try_pop().unwrap();
+        let after = snapshots.try_pop().unwrap();
+        assert_eq!(before.discontinuity_id, 0);
+        assert_eq!(after.discontinuity_id, 1);
+        assert!(after.window_start_frame > before.window_start_frame + 2048);
+        worker.stop();
     }
 }

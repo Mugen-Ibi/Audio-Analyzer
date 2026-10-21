@@ -1,5 +1,6 @@
 //! Nonblocking UI control plane. Driver ownership stays on the supervisor.
 use crate::{
+    config::{AnalysisConfig, InputSettings},
     model::{AnalysisSnapshot, ChannelRoute, RuntimeStats},
     pipeline::{AnalysisReader, AnalyzerRuntime},
     source::{AudioInfo, InputSource},
@@ -42,7 +43,7 @@ pub struct AnalyzerController {
     state: ConnectionState,
     session: Option<SessionView>,
     idle_stats: RuntimeStats,
-    starts: HeapProd<()>,
+    starts: HeapProd<(InputSettings, AnalysisConfig)>,
     events: HeapCons<Event>,
     cancelled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -67,8 +68,14 @@ impl AnalyzerController {
                         drop(runtime.take());
                         pending = Some(Event::Stopped);
                     }
-                    if requests.try_pop().is_some() {
-                        let result = AnalyzerRuntime::start_with(&mut source, &worker_cancelled);
+                    if let Some((input, analysis)) = requests.try_pop() {
+                        let result = source.configure(&input).and_then(|_| {
+                            AnalyzerRuntime::start_configured(
+                                &mut source,
+                                &worker_cancelled,
+                                analysis,
+                            )
+                        });
                         if worker_cancelled.load(Ordering::Acquire) {
                             drop(result);
                             pending = Some(Event::Stopped);
@@ -113,6 +120,16 @@ impl AnalyzerController {
 
     /// Returns immediately. Repeated starts while busy are rejected.
     pub fn start(&mut self) -> Result<(), String> {
+        self.start_configured(InputSettings::default(), AnalysisConfig::default())
+    }
+
+    pub fn start_configured(
+        &mut self,
+        input: InputSettings,
+        analysis: AnalysisConfig,
+    ) -> Result<(), String> {
+        input.validate()?;
+        analysis.validate()?;
         if !matches!(
             self.state,
             ConnectionState::Stopped | ConnectionState::Failed(_)
@@ -121,7 +138,7 @@ impl AnalyzerController {
         }
         self.cancelled.store(false, Ordering::Release);
         self.starts
-            .try_push(())
+            .try_push((input, analysis))
             .map_err(|_| "an input start request is already pending".to_owned())?;
         self.state = ConnectionState::Starting;
         Ok(())
@@ -191,6 +208,14 @@ impl AnalyzerController {
             .as_mut()
             .and_then(|session| session.reader.take_latest())
     }
+
+    pub fn set_analysis(&self, config: AnalysisConfig) -> Result<(), String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "input is not connected".to_owned())?
+            .reader
+            .set_analysis(config)
+    }
 }
 
 impl Drop for AnalyzerController {
@@ -236,6 +261,8 @@ mod tests {
                     sample_rate: 48_000,
                     channels: 1,
                     initial_route: route,
+                    buffer_frames: None,
+                    selection_notes: String::new(),
                 },
                 input,
                 Box::new(SilentStream(Some(writer), Arc::clone(&self.0))),

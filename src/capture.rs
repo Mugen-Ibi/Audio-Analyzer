@@ -60,6 +60,25 @@ impl CaptureWriter {
     /// Conversion must not allocate, lock, or wait.
     pub fn write_interleaved<T: Copy>(&mut self, data: &[T], convert: impl Fn(T) -> f32) {
         let frames = data.len() / self.channels;
+        self.stats
+            .callback_frames
+            .store(frames as u64, Ordering::Relaxed);
+        self.stats
+            .callback_max_frames
+            .fetch_max(frames as u64, Ordering::Relaxed);
+        if frames > 0 {
+            let _ = self.stats.callback_min_frames.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |old| {
+                    Some(if old == 0 {
+                        frames as u64
+                    } else {
+                        old.min(frames as u64)
+                    })
+                },
+            );
+        }
         if !data.len().is_multiple_of(self.channels) {
             let discarded = self.assembler.block.valid_frames;
             self.assembler.block.clear();
@@ -73,6 +92,9 @@ impl CaptureWriter {
         self.stats
             .received_audio_frames
             .fetch_add(frames as u64, Ordering::Relaxed);
+        self.stats
+            .latest_frame
+            .store(self.assembler.next_frame + frames as u64, Ordering::Release);
         let (route, generation) = self.route_control.load();
         let discarded = self.assembler.begin_callback(route, generation);
         self.stats
@@ -85,6 +107,18 @@ impl CaptureWriter {
                     .reference
                     .map_or(0.0, |channel| convert(frame[channel])),
             };
+            if !pair.measurement.is_finite()
+                || pair.measurement.abs() > 16.0
+                || (route.reference.is_some()
+                    && (!pair.reference.is_finite() || pair.reference.abs() > 16.0))
+            {
+                self.stats.invalid_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            if pair.measurement.abs() >= 1.0
+                || (route.reference.is_some() && pair.reference.abs() >= 1.0)
+            {
+                self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(block) = self.assembler.push(pair)
                 && let Err(mut rejected) = self.producer.try_push(block)
             {

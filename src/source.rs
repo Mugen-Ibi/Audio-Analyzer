@@ -8,6 +8,8 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct AudioInfo {
+    pub buffer_frames: Option<u32>,
+    pub selection_notes: String,
     pub host_name: String,
     pub device_name: String,
     pub sample_rate: u32,
@@ -27,6 +29,9 @@ impl AudioInfo {
 
 /// Only the factory crosses threads. The opened stream need not implement Send.
 pub trait InputSource {
+    fn configure(&mut self, _settings: &crate::config::InputSettings) -> Result<(), String> {
+        Ok(())
+    }
     fn open(
         &mut self,
         stats: Arc<RuntimeStats>,
@@ -107,6 +112,8 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 2,
                 initial_route: route,
+                buffer_frames: None,
+                selection_notes: String::new(),
             },
             input,
             Box::new(LocalStream(Rc::clone(&stops))),
@@ -130,6 +137,8 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 3,
                 initial_route: route,
+                buffer_frames: None,
+                selection_notes: String::new(),
             },
             input,
             Box::new(LocalStream(Rc::clone(&stops))),

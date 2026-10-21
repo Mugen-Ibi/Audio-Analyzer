@@ -53,20 +53,26 @@ fn callback_overload_and_fft_processing_allocate_nothing_after_construction() {
         Arc::new(RuntimeStats::default()),
     )
     .unwrap();
-    let mut analyzer = SpectrumAnalyzer::new(48_000);
     let data = [0.25; AUDIO_BLOCK_FRAMES * 2];
     let mut block = AudioBlock {
         valid_frames: AUDIO_BLOCK_FRAMES,
         has_reference: true,
         ..AudioBlock::default()
     };
-    ALLOCATIONS.set(0);
-    TRACKING.set(true);
-    for index in 0..128 {
-        writer.write_interleaved(&data, |value| value);
-        block.start_frame = index * AUDIO_BLOCK_FRAMES as u64;
-        std::hint::black_box(analyzer.process_block(&block));
+    for config in [
+        audio_analyzer::config::AnalysisConfig::FAST,
+        audio_analyzer::config::AnalysisConfig::default(),
+        audio_analyzer::config::AnalysisConfig::PRECISE,
+    ] {
+        let mut analyzer = SpectrumAnalyzer::with_config(48_000, config).unwrap();
+        ALLOCATIONS.set(0);
+        TRACKING.set(true);
+        for index in 0..128 {
+            writer.write_interleaved(&data, |value| value);
+            block.start_frame = index * AUDIO_BLOCK_FRAMES as u64;
+            std::hint::black_box(analyzer.process_block(&block));
+        }
+        TRACKING.set(false);
+        assert_eq!(ALLOCATIONS.get(), 0);
     }
-    TRACKING.set(false);
-    assert_eq!(ALLOCATIONS.get(), 0);
 }
