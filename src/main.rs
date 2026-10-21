@@ -32,6 +32,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let demo = args.iter().any(|a| a == "--demo");
     let screenshot = value("--qa-screenshot").map(PathBuf::from);
     let qa_idle = args.iter().any(|a| a == "--qa-idle");
+    let qa_endurance = value("--qa-endurance").map(PathBuf::from);
+    if qa_endurance.is_some() && (!demo || screenshot.is_some()) {
+        return Err(
+            "endurance requires --demo and cannot share the short screenshot QA mode".into(),
+        );
+    }
     if screenshot.is_some() && !demo && !qa_idle {
         return Err(
             "native QA requires --demo or --qa-idle; audio capture is never auto-started".into(),
@@ -119,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         },
+        qa_endurance,
     };
     eframe::run_native(
         "Audio Visualizer",

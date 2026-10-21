@@ -1,3 +1,4 @@
+mod endurance;
 mod theme;
 mod waterfall;
 mod widgets;
@@ -37,6 +38,7 @@ pub struct AppOptions {
     pub qa_cursor: bool,
     pub qa_duration: f64,
     pub qa_minimum_dbfs: Option<f32>,
+    pub qa_endurance: Option<PathBuf>,
 }
 pub struct AnalyzerApp {
     runtime: AnalyzerController,
@@ -79,6 +81,7 @@ pub struct AnalyzerApp {
     launched: Instant,
     last_tick: Option<Instant>,
     tick_intervals: Vec<f64>,
+    endurance: Option<endurance::Trace>,
 }
 impl AnalyzerApp {
     pub fn new(
@@ -142,6 +145,13 @@ impl AnalyzerApp {
             launched: Instant::now(),
             last_tick: None,
             tick_intervals: Vec::with_capacity(4096),
+            endurance: options
+                .qa_endurance
+                .as_ref()
+                .filter(|_| options.demo)
+                .map(|path| {
+                    endurance::Trace::open(path).expect("cannot create fresh endurance trace files")
+                }),
         };
         if app.screenshot.is_some() {
             if let Some(minimum) = options
@@ -1584,7 +1594,198 @@ impl AnalyzerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
-    fn tick(&mut self, ctx: &egui::Context) {
+    fn endurance_before(&mut self, ctx: &egui::Context, now: f64) {
+        use endurance::{Action, SCHEDULE};
+        let Some(mut trace) = self.endurance.take() else {
+            return;
+        };
+        let t = trace.elapsed();
+        if !trace.complete {
+            while trace.next < SCHEDULE.len() && t >= SCHEDULE[trace.next].0 {
+                let action = SCHEDULE[trace.next].1;
+                trace.next += 1;
+                match action {
+                    Action::Orbit => trace.event("orbit_start"),
+                    Action::Reference => {
+                        self.capture_reference();
+                        trace.event("reference_capture_and_compare");
+                    }
+                    Action::Hold => {
+                        self.freeze(now);
+                        trace.event("hold_on");
+                    }
+                    Action::Live => {
+                        self.return_live();
+                        trace.event("hold_off");
+                    }
+                    Action::Wide => {
+                        while self.viewport.visible_seconds() < 600.0 {
+                            self.viewport.zoom_out();
+                        }
+                        trace.event("history_span_600s");
+                    }
+                    Action::Reset => {
+                        self.settings.camera = Default::default();
+                        trace.event("camera_reset");
+                    }
+                    Action::Finish => {}
+                }
+            }
+            if endurance::rotating(t) {
+                self.settings.camera.yaw = (t * 0.18).sin() as f32 * 0.7;
+                self.settings.camera.pitch = 0.6 + (t * 0.13).sin() as f32 * 0.2;
+                self.settings.camera.zoom = 1.0 + (t * 0.11).sin() as f32 * 0.15;
+            }
+        } else {
+            for event in ctx.input(|i| i.events.clone()) {
+                if let egui::Event::Screenshot { image, .. } = event
+                    && !image.size.contains(&0)
+                {
+                    let bytes: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                    match image::save_buffer(
+                        trace.directory.join("final.png"),
+                        &bytes,
+                        image.size[0] as u32,
+                        image.size[1] as u32,
+                        image::ColorType::Rgba8,
+                    ) {
+                        Ok(()) => {
+                            trace.event("screenshot_written_after_measurement");
+                            println!("ENDURANCE final PNG written");
+                        }
+                        Err(e) => eprintln!("ENDURANCE screenshot write failed: {e}"),
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            if t > endurance::SECONDS + 15.0 {
+                trace.event("post_measurement_screenshot_timeout");
+                eprintln!("ENDURANCE screenshot timeout; measurement retained");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        self.endurance = Some(trace);
+    }
+    fn endurance_after(&mut self, ctx: &egui::Context, began: Instant, previous_cpu_ms: f64) {
+        let Some(mut trace) = self.endurance.take() else {
+            return;
+        };
+        if !trace.complete {
+            let instant = began;
+            let t = trace.elapsed();
+            let wall = endurance::utc_ms();
+            let (uptime, awake) = endurance::clocks();
+            let (interval, wall_delta, awake_delta, uptime_delta) = trace
+                .last
+                .replace((instant, wall, awake, uptime))
+                .map_or((0.0, 0.0, 0.0, 0.0), |(last, w, a, u)| {
+                    (
+                        (instant - last).as_secs_f64() * 1000.0,
+                        wall - w,
+                        awake - a,
+                        uptime - u,
+                    )
+                });
+            if t as u64 != trace.gap_second {
+                trace.gaps = self.history.points().iter().filter(|p| p.gap).count();
+                trace.gap_second = t as u64;
+                if (t as u64).is_multiple_of(30) {
+                    println!(
+                        "ENDURANCE t={t:.1}s history={} gaps={} held={} phase={}",
+                        self.history.points().len(),
+                        trace.gaps,
+                        self.held_end.is_some(),
+                        endurance::phase(t)
+                    );
+                }
+            }
+            let minimized =
+                ctx.input(|i| i.viewport().minimized.map_or(-1.0, |v| u8::from(v) as f64));
+            let focused = ctx.input(|i| u8::from(i.focused) as f64);
+            let size = ctx.screen_rect().size();
+            let stats = self.runtime.stats();
+            let row = [
+                t,
+                wall,
+                interval,
+                wall_delta,
+                awake_delta,
+                uptime_delta,
+                began.elapsed().as_secs_f64() * 1000.0,
+                previous_cpu_ms,
+                minimized,
+                focused,
+                size.x as f64,
+                size.y as f64,
+                ctx.pixels_per_point() as f64,
+                u8::from(self.held_end.is_some()) as f64,
+                u8::from(self.baseline.is_some()) as f64,
+                self.viewport.visible_seconds(),
+                self.history.points().len() as f64,
+                self.history.points().front().map_or(-1.0, |p| p.seconds),
+                self.history.points().back().map_or(-1.0, |p| p.seconds),
+                trace.gaps as f64,
+                stats.dropped_audio_frames.load(Ordering::Relaxed) as f64,
+                stats.dropped_results.load(Ordering::Relaxed) as f64,
+                stats.coalesced_results.load(Ordering::Relaxed) as f64,
+                stats.received_audio_frames.load(Ordering::Relaxed) as f64,
+                self.waterfall.vertices as f64,
+                self.waterfall.rebuild_ms,
+                u8::from(endurance::rotating(t)) as f64,
+                endurance::phase(t) as f64,
+                self.live.as_ref().map_or(-1.0, |s| s.sequence as f64),
+                self.displayed().map_or(-1.0, |s| s.sequence as f64),
+                self.freshness().map_or(-1.0, |a| a * 1000.0),
+            ];
+            trace.frame(row);
+            if interval > 50.0 {
+                trace.event("interval_over_50ms");
+            }
+            if t >= endurance::SECONDS {
+                trace.complete = true;
+                trace.event("measurement_end");
+                let summary = serde_json::json!({"requested_seconds":endurance::SECONDS,"elapsed_seconds":t,"frames":trace.frames,"trace_rows_dropped":trace.dropped,"history_records":self.history.points().len(),"history_oldest":self.history.points().front().map(|p|p.seconds),"history_newest":self.history.points().back().map(|p|p.seconds),"history_gaps":trace.gaps,"audio_drops":stats.dropped_audio_frames.load(Ordering::Relaxed),"result_drops":stats.dropped_results.load(Ordering::Relaxed),"invalid_samples":stats.invalid_samples.load(Ordering::Relaxed),"stream_errors":stats.stream_errors.load(Ordering::Relaxed),"actions_executed":trace.next,"no_hardware":self.demo});
+                let write = || -> Result<(), Box<dyn std::error::Error>> {
+                    std::fs::write(
+                        trace.directory.join("summary.json"),
+                        serde_json::to_vec_pretty(&summary)?,
+                    )?;
+                    use std::io::Write;
+                    let mut out = std::io::BufWriter::new(std::fs::File::create(
+                        trace.directory.join("history.csv"),
+                    )?);
+                    writeln!(
+                        out,
+                        "seconds,gap,segment,measurement_rms,reference_rms,sample_rate,fft_size"
+                    )?;
+                    for p in self.history.points() {
+                        writeln!(
+                            out,
+                            "{:.6},{},{},{:.6},{:.6},{},{}",
+                            p.seconds,
+                            p.gap,
+                            p.segment,
+                            p.measurement_rms,
+                            p.reference_rms.unwrap_or(-120.0),
+                            p.sample_rate,
+                            p.config.fft_size
+                        )?;
+                    }
+                    out.flush()?;
+                    Ok(())
+                };
+                if let Err(e) = write() {
+                    eprintln!("ENDURANCE result write failed: {e}");
+                }
+                println!("ENDURANCE measurement completed at {t:.3}s");
+                trace.event("screenshot_request_after_measurement");
+                trace.screenshot_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            }
+        }
+        self.endurance = Some(trace);
+    }
+    fn tick(&mut self, ctx: &egui::Context, previous_cpu_ms: f64) {
         let instant = Instant::now();
         if let Some(last) = self.last_tick.replace(instant)
             && self.tick_intervals.len() < 4096
@@ -1594,6 +1795,7 @@ impl AnalyzerApp {
         }
         let now = ctx.input(|i| i.time);
         self.poll(now);
+        self.endurance_before(ctx, now);
         if self.screenshot.is_some()
             && self.live.is_some()
             && self.launched.elapsed() >= Duration::from_secs(1)
@@ -1627,12 +1829,16 @@ impl AnalyzerApp {
         self.dashboard(ctx, now);
         self.settings_window(ctx);
         self.native_qa(ctx);
+        self.endurance_after(ctx, instant, previous_cpu_ms);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
 impl eframe::App for AnalyzerApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.tick(ctx);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.tick(
+            ctx,
+            frame.info().cpu_usage.map_or(-1.0, |s| s as f64 * 1000.0),
+        );
     }
 }
 #[cfg(test)]
