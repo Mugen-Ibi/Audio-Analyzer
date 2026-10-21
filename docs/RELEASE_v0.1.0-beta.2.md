@@ -1,6 +1,6 @@
 # Audio Visualizer v0.1.0-beta.2
 
-Windows x64 prerelease. The product tag contains the production visualizer; a separate diagnostic branch preserves the bounded endurance instrumentation and aggregate report. No default-branch merge is required for this release.
+Windows x64 prerelease. The ASIO-enabled executable and combined corresponding source are distributed under GNU GPL version 3; original MIT/dependency/font notices are retained. See [distribution terms](../LICENSE-DISTRIBUTION.md) and `COPYING.GPLv3`. Download the dedicated corresponding-source asset for the project, locked dependency sources and required ASIO sources. The product tag contains the production visualizer; a separate diagnostic branch preserves the bounded endurance instrumentation and aggregate report. No default-branch merge is required for this release.
 
 ## Use
 
@@ -30,3 +30,5 @@ Physical microphone latency, M2/AT4040 operation, built-in AGC/noise processing,
 ## Build and package provenance
 
 The Windows MSVC executable is rebuilt from this tag with Rust 1.99, `Cargo.lock`, all features and the existing vendored framebuffer patch. Rust `--remap-path-prefix` removes private workspace and dependency-cache paths. ASIO build inputs require a complete SDK, LLVM/libclang and ASCII SDK/target directories. The package includes the executable, usage, project license and third-party license notices. Debug symbols, raw diagnostic logs, local OS inventories and private transfer records are excluded. Release assets include SHA256 information; the executable's Rust/Cargo/font/vendor inputs match the previously tested product snapshot exactly.
+
+The published executable is built offline from the supplied corresponding-source contents using `scripts/build-corresponding-source.ps1`. No additional feature or performance work was performed for publication.
