@@ -55,7 +55,7 @@ impl InputSource for ToneSource {
             let mut position = 0;
             let mut data = [0.0; AUDIO_BLOCK_FRAMES * 2];
             while !thread_stop.load(Ordering::Acquire) {
-                for pair in data.chunks_exact_mut(2) {
+                for pair in data.as_chunks_mut::<2>().0 {
                     let phase = 2.0 * std::f32::consts::PI * 32.0 * (position % FFT_SIZE) as f32
                         / FFT_SIZE as f32;
                     pair[0] = 0.5 * phase.sin();

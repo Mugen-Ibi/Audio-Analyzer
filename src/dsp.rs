@@ -10,6 +10,10 @@ use crate::model::{
 const AVERAGING_ALPHA: f32 = 0.2;
 const MIN_DB: f32 = -120.0;
 const POWER_EPSILON: f32 = 1.0e-20;
+// A complex FFT component is bounded by FFT_SIZE * max_sample. Keeping that
+// below sqrt(f32::MAX) / 4 leaves headroom for squared magnitudes and products.
+// This limit is over +300 dBFS: ordinary finite overshoots remain unmodified.
+const MAX_SAMPLE_MAGNITUDE: f32 = 4.0e18 / FFT_SIZE as f32;
 
 pub struct SpectrumAnalyzer {
     sample_rate: u32,
@@ -64,6 +68,12 @@ impl SpectrumAnalyzer {
     }
 
     pub fn process_block(&mut self, block: &AudioBlock) -> Option<AnalysisSnapshot> {
+        let Some(frames) = block.frames.get(..block.valid_frames) else {
+            // AudioBlock is a public adapter boundary. Reject corrupt lengths
+            // rather than panic or splice the next valid block into old overlap.
+            self.reset_history();
+            return None;
+        };
         let input_discontinuity = self
             .expected_input_frame
             .is_some_and(|expected| expected != block.start_frame);
@@ -79,7 +89,7 @@ impl SpectrumAnalyzer {
         self.expected_input_frame = Some(block.start_frame + block.valid_frames as u64);
 
         let mut newest = None;
-        for (offset, frame) in block.frames[..block.valid_frames].iter().enumerate() {
+        for (offset, frame) in frames.iter().enumerate() {
             if self.samples.is_empty() {
                 self.window_start_frame = block.start_frame + offset as u64;
             }
@@ -194,13 +204,15 @@ impl SpectrumAnalyzer {
 
             if has_reference && self.averaged_reference_power[bin] > POWER_EPSILON {
                 let transfer = self.averaged_cross_power[bin] / self.averaged_reference_power[bin];
-                metrics.transfer_db = amplitude_to_db(transfer.norm());
+                let wide_transfer = Complex::new(f64::from(transfer.re), f64::from(transfer.im));
+                metrics.transfer_db = (20.0 * wide_transfer.norm().max(1.0e-6).log10()) as f32;
                 metrics.phase_degrees = transfer.arg().to_degrees();
-                let denominator =
-                    self.averaged_reference_power[bin] * self.averaged_measurement_power[bin];
-                if denominator > POWER_EPSILON {
-                    metrics.coherence =
-                        (self.averaged_cross_power[bin].norm_sqr() / denominator).clamp(0.0, 1.0);
+                let denominator = f64::from(self.averaged_reference_power[bin])
+                    * f64::from(self.averaged_measurement_power[bin]);
+                if denominator > f64::from(POWER_EPSILON) {
+                    let cross = self.averaged_cross_power[bin];
+                    let cross = Complex::new(f64::from(cross.re), f64::from(cross.im));
+                    metrics.coherence = (cross.norm_sqr() / denominator).clamp(0.0, 1.0) as f32;
                 }
             }
             snapshot.bins[bin] = metrics;
@@ -211,7 +223,11 @@ impl SpectrumAnalyzer {
 }
 
 fn finite_sample(sample: f32) -> f32 {
-    if sample.is_finite() { sample } else { 0.0 }
+    if sample.is_finite() && sample.abs() <= MAX_SAMPLE_MAGNITUDE {
+        sample
+    } else {
+        0.0
+    }
 }
 
 fn blend(previous: f32, current: f32) -> f32 {
@@ -228,17 +244,17 @@ fn amplitude_to_db(amplitude: f32) -> f32 {
 
 fn signal_level(samples: impl Iterator<Item = f32>) -> SignalLevel {
     let mut peak = 0.0_f32;
-    let mut sum_squares = 0.0_f32;
+    let mut sum_squares = 0.0_f64;
     let mut count = 0_usize;
     for sample in samples {
         peak = peak.max(sample.abs());
-        sum_squares += sample * sample;
+        sum_squares += f64::from(sample) * f64::from(sample);
         count += 1;
     }
     let rms = if count == 0 {
         0.0
     } else {
-        (sum_squares / count as f32).sqrt()
+        (sum_squares / count as f64).sqrt() as f32
     };
     SignalLevel {
         peak_dbfs: amplitude_to_db(peak),
@@ -247,19 +263,21 @@ fn signal_level(samples: impl Iterator<Item = f32>) -> SignalLevel {
 }
 
 fn phase_correlation(samples: &[StereoFrame]) -> f32 {
-    let mut cross = 0.0_f32;
-    let mut reference_power = 0.0_f32;
-    let mut measurement_power = 0.0_f32;
+    let mut cross = 0.0_f64;
+    let mut reference_power = 0.0_f64;
+    let mut measurement_power = 0.0_f64;
     for frame in samples {
-        cross += frame.reference * frame.measurement;
-        reference_power += frame.reference * frame.reference;
-        measurement_power += frame.measurement * frame.measurement;
+        let reference = f64::from(frame.reference);
+        let measurement = f64::from(frame.measurement);
+        cross += reference * measurement;
+        reference_power += reference * reference;
+        measurement_power += measurement * measurement;
     }
     let denominator = (reference_power * measurement_power).sqrt();
-    if denominator <= POWER_EPSILON {
+    if denominator <= f64::from(POWER_EPSILON) {
         0.0
     } else {
-        (cross / denominator).clamp(-1.0, 1.0)
+        (cross / denominator).clamp(-1.0, 1.0) as f32
     }
 }
 
@@ -267,6 +285,53 @@ fn phase_correlation(samples: &[StereoFrame]) -> f32 {
 mod tests {
     use super::*;
     use crate::model::{AUDIO_BLOCK_FRAMES, AudioBlock, StereoFrame};
+
+    #[test]
+    fn malformed_block_is_rejected_and_clears_overlap() {
+        let mut analyzer = SpectrumAnalyzer::new(48_000);
+        let mut block = AudioBlock {
+            valid_frames: AUDIO_BLOCK_FRAMES,
+            ..AudioBlock::default()
+        };
+        assert!(analyzer.process_block(&block).is_none());
+        block.valid_frames = AUDIO_BLOCK_FRAMES + 1;
+        assert!(analyzer.process_block(&block).is_none());
+        assert!(analyzer.samples.is_empty());
+    }
+
+    #[test]
+    fn large_finite_signals_keep_unit_coherence_and_correlation() {
+        let snapshot = analyze_signals(48_000, |_| 1.0e10, |_| 5.0e9);
+        assert!((snapshot.bins[0].transfer_db + 6.0206).abs() < 0.01);
+        assert!(snapshot.bins[0].coherence > 0.999);
+        assert!(snapshot.phase_correlation.unwrap() > 0.999);
+        let high_gain = analyze_signals(48_000, |_| 1.0e-6, |_| 1.0e15);
+        assert!((high_gain.bins[0].transfer_db - 420.0).abs() < 0.01);
+        assert!(high_gain.bins[0].coherence > 0.999);
+    }
+
+    #[test]
+    fn finite_audio_above_full_scale_is_not_clipped() {
+        let snapshot = analyze_signals(48_000, |_| 4.0, |_| 8.0);
+        assert!((snapshot.bins[0].measurement_dbfs - 18.0618).abs() < 0.01);
+        assert!((snapshot.measurement_level.peak_dbfs - 18.0618).abs() < 0.01);
+        assert!((snapshot.measurement_level.rms_dbfs - 18.0618).abs() < 0.01);
+        assert!((snapshot.bins[0].transfer_db - 6.0206).abs() < 0.01);
+    }
+
+    #[test]
+    fn arithmetic_overflow_input_does_not_poison_metrics() {
+        let snapshot = analyze_signals(48_000, |_| f32::MAX, |_| -f32::MAX);
+        assert!(snapshot.measurement_level.rms_dbfs.is_finite());
+        assert!(snapshot.phase_correlation.unwrap().is_finite());
+        for bin in snapshot.bins {
+            assert!(bin.reference_dbfs.is_finite());
+            assert!(bin.measurement_dbfs.is_finite());
+            assert!(bin.transfer_db.is_finite());
+            assert!(bin.phase_degrees.is_finite());
+            assert!(bin.coherence.is_finite());
+        }
+    }
 
     #[test]
     fn non_finite_samples_do_not_poison_fft_or_averages() {

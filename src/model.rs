@@ -66,9 +66,8 @@ impl ChannelRoute {
         }
         if self.measurement >= channels {
             return Err(format!(
-                "Measurement channel {} is outside the {} available channels",
-                self.measurement + 1,
-                channels
+                "Measurement channel index {} is outside the {} available channels",
+                self.measurement, channels
             ));
         }
         if self.reference.is_some_and(|channel| channel >= channels) {
@@ -97,7 +96,7 @@ impl RouteControl {
 
     pub fn store(&self, route: ChannelRoute) {
         self.packed_route
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
                 let (_, generation) = unpack_route(packed);
                 Some(pack_route(route, generation.wrapping_add(1)))
             })
@@ -195,6 +194,18 @@ impl Default for AnalysisSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_channel_index_returns_an_error_without_overflowing() {
+        assert!(
+            ChannelRoute {
+                reference: None,
+                measurement: usize::MAX
+            }
+            .validate(2)
+            .is_err()
+        );
+    }
 
     #[test]
     fn disabled_reference_round_trips() {

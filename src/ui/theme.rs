@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke, TextStyle, Vec2,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
+    Vec2,
 };
 
 pub const BACKGROUND: Color32 = Color32::from_rgb(0x08, 0x0b, 0x12);
@@ -65,10 +66,11 @@ pub fn install(ctx: &egui::Context) {
         .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_fonts);
     ctx.set_fonts(fonts);
 
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = Vec2::splat(10.0);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
-    style.spacing.window_margin = egui::Margin::same(18.0);
+    style.spacing.window_margin = egui::Margin::same(18);
     style.text_styles.insert(
         TextStyle::Heading,
         FontId::new(22.0, FontFamily::Name(BOLD_FAMILY.into())),
@@ -89,8 +91,8 @@ pub fn install(ctx: &egui::Context) {
     style.visuals.extreme_bg_color = BACKGROUND;
     style.visuals.faint_bg_color = SURFACE_LOW;
     style.visuals.override_text_color = Some(TEXT);
-    style.visuals.window_rounding = Rounding::same(12.0);
-    style.visuals.menu_rounding = Rounding::same(8.0);
+    style.visuals.window_corner_radius = CornerRadius::same(12);
+    style.visuals.menu_corner_radius = CornerRadius::same(8);
     style.visuals.window_stroke = Stroke::new(1.0, OUTLINE);
     style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(91, 168, 255, 45);
     style.visuals.selection.stroke = Stroke::new(1.0, CYAN);
@@ -102,7 +104,7 @@ pub fn install(ctx: &egui::Context) {
         &mut style.visuals.widgets.active,
         &mut style.visuals.widgets.open,
     ] {
-        visuals.rounding = Rounding::same(7.0);
+        visuals.corner_radius = CornerRadius::same(7);
     }
     style.visuals.widgets.noninteractive.bg_fill = SURFACE;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, OUTLINE);
@@ -112,7 +114,7 @@ pub fn install(ctx: &egui::Context) {
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, CYAN);
     style.visuals.widgets.active.bg_fill = SURFACE_LOW;
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, CYAN);
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }
 
 pub fn bold(size: f32) -> FontId {

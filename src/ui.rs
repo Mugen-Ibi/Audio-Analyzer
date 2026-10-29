@@ -5,10 +5,10 @@ mod widgets;
 use std::{cell::Cell, sync::atomic::Ordering, time::Duration};
 
 use eframe::egui::{
-    self, Align, CentralPanel, Frame, Layout, RichText, ScrollArea, SidePanel, Stroke,
-    TextureHandle, TextureOptions, TopBottomPanel, ViewportCommand, vec2,
+    self, Align, CentralPanel, Frame, Layout, Panel, RichText, ScrollArea, Stroke, TextureHandle,
+    TextureOptions, ViewportCommand, vec2,
 };
-use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotPoint, PlotPoints};
 
 use crate::{
     controller::{AnalyzerController, ConnectionState},
@@ -32,11 +32,11 @@ pub struct AnalyzerApp {
     reference_channel: Option<usize>,
     measurement_channel: usize,
     route_error: Option<String>,
-    reference_points: Vec<[f64; 2]>,
-    measurement_points: Vec<[f64; 2]>,
-    transfer_points: Vec<[f64; 2]>,
-    phase_points: Vec<[f64; 2]>,
-    coherence_points: Vec<[f64; 2]>,
+    reference_points: Vec<PlotPoint>,
+    measurement_points: Vec<PlotPoint>,
+    transfer_points: Vec<PlotPoint>,
+    phase_points: Vec<PlotPoint>,
+    coherence_points: Vec<PlotPoint>,
     scope_points: Vec<StereoFrame>,
     measurement_level: SignalLevel,
     reference_level: Option<SignalLevel>,
@@ -185,37 +185,37 @@ impl AnalyzerApp {
                     continue;
                 }
                 let log_frequency = frequency.log10();
-                self.measurement_points
-                    .push([log_frequency, metrics.measurement_dbfs as f64]);
+                self.measurement_points.push(PlotPoint::new(
+                    log_frequency,
+                    metrics.measurement_dbfs as f64,
+                ));
                 if snapshot.has_reference {
                     self.reference_points
-                        .push([log_frequency, metrics.reference_dbfs as f64]);
+                        .push(PlotPoint::new(log_frequency, metrics.reference_dbfs as f64));
                     self.transfer_points
-                        .push([log_frequency, metrics.transfer_db as f64]);
+                        .push(PlotPoint::new(log_frequency, metrics.transfer_db as f64));
                     self.phase_points
-                        .push([log_frequency, metrics.phase_degrees as f64]);
+                        .push(PlotPoint::new(log_frequency, metrics.phase_degrees as f64));
                     self.coherence_points
-                        .push([log_frequency, metrics.coherence as f64]);
+                        .push(PlotPoint::new(log_frequency, metrics.coherence as f64));
                 }
             }
         }
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        TopBottomPanel::top("instrument_top_bar")
-            .exact_height(68.0)
-            .frame(
-                Frame::none()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, OUTLINE)),
-            )
-            .show(ctx, |ui| {
+    fn top_bar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
+        Panel::top("instrument_top_bar")
+            .exact_size(68.0)
+            .resizable(false)
+            .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, OUTLINE)))
+            .show(root_ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(18.0);
-                    Frame::none()
+                    Frame::NONE
                         .fill(CYAN)
-                        .rounding(8.0)
-                        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new("SA")
@@ -289,16 +289,12 @@ impl AnalyzerApp {
             });
     }
 
-    fn side_bar(&mut self, ctx: &egui::Context) {
-        SidePanel::left("instrument_side_bar")
-            .exact_width(188.0)
+    fn side_bar(&mut self, root_ui: &mut egui::Ui) {
+        Panel::left("instrument_side_bar")
+            .exact_size(188.0)
             .resizable(false)
-            .frame(
-                Frame::none()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, OUTLINE)),
-            )
-            .show(ctx, |ui| {
+            .frame(Frame::NONE.fill(SURFACE).stroke(Stroke::new(1.0, OUTLINE)))
+            .show(root_ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(18.0);
                     ui.label(
@@ -339,15 +335,17 @@ impl AnalyzerApp {
             });
     }
 
-    fn status_bar(&self, ctx: &egui::Context) {
-        TopBottomPanel::bottom("instrument_status_bar")
-            .exact_height(32.0)
+    fn status_bar(&self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
+        Panel::bottom("instrument_status_bar")
+            .exact_size(32.0)
+            .resizable(false)
             .frame(
-                Frame::none()
+                Frame::NONE
                     .fill(BACKGROUND)
                     .stroke(Stroke::new(1.0, OUTLINE)),
             )
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(14.0);
                     let stats = self.runtime.stats();
@@ -400,14 +398,15 @@ impl AnalyzerApp {
             });
     }
 
-    fn dashboard(&mut self, ctx: &egui::Context) {
+    fn dashboard(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
         CentralPanel::default()
             .frame(
-                Frame::none()
+                Frame::NONE
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::same(18.0)),
+                    .inner_margin(egui::Margin::same(18)),
             )
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 let mut scroll = ScrollArea::vertical().auto_shrink([false, false]);
                 if self.reset_scroll {
                     scroll = scroll.vertical_scroll_offset(0.0);
@@ -790,17 +789,15 @@ impl AnalyzerApp {
             plot = plot.reset();
         }
         let response = plot.show(ui, |plot_ui| {
-            let measurement = Line::new(PlotPoints::from_iter(points.iter().copied()))
+            let measurement = Line::new("測定", PlotPoints::Borrowed(points))
                 .color(CYAN)
-                .width(1.8)
-                .name("測定");
+                .width(1.8);
             plot_ui.line(measurement);
             if self.analysis_view == AnalysisView::Spectrum && self.has_reference {
                 plot_ui.line(
-                    Line::new(PlotPoints::from_iter(self.reference_points.iter().copied()))
+                    Line::new("基準", PlotPoints::Borrowed(&self.reference_points))
                         .color(GREEN.gamma_multiply(0.55))
-                        .width(1.1)
-                        .name("基準"),
+                        .width(1.1),
                 );
             }
         });
@@ -1061,21 +1058,44 @@ impl AnalyzerApp {
         }
     }
 
-    fn connection_bar(&mut self, ctx: &egui::Context) {
+    fn expire_live_metrics(&mut self, now: f64) {
+        if self
+            .last_snapshot_time
+            .is_some_and(|last| now - last >= 1.0)
+        {
+            // A stalled stream delivers no quiet samples to release SignalGate.
+            // Clear live indicators while keeping the last plot and history,
+            // including an explicitly held spectrum, available for inspection.
+            self.last_snapshot_time = None;
+            self.measurement_signal = SignalGate::default();
+            self.reference_signal = SignalGate::default();
+            self.measurement_level = SignalLevel::default();
+            self.reference_level = None;
+            self.phase_correlation = None;
+            self.scope_points.clear();
+            self.measurement_peak_hold = PeakHold::default();
+            self.reference_peak_hold = PeakHold::default();
+            self.measurement_held_dbfs = -120.0;
+            self.reference_held_dbfs = -120.0;
+        }
+    }
+
+    fn connection_bar(&mut self, root_ui: &mut egui::Ui) {
         let state = self.runtime.state().clone();
         let can_start = matches!(
             &state,
             ConnectionState::Stopped | ConnectionState::Failed(_)
         );
         let can_stop = matches!(&state, ConnectionState::Starting | ConnectionState::Running);
-        TopBottomPanel::top("input_connection")
-            .exact_height(52.0)
+        Panel::top("input_connection")
+            .exact_size(52.0)
+            .resizable(false)
             .frame(
-                Frame::none()
+                Frame::NONE
                     .fill(SURFACE_LOW)
                     .stroke(Stroke::new(1.0, OUTLINE)),
             )
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(14.0);
                     let (label, color) = match &state {
@@ -1162,28 +1182,30 @@ impl AnalyzerApp {
 }
 
 impl eframe::App for AnalyzerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.tick(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.tick(ui);
     }
 }
 
 impl AnalyzerApp {
-    fn tick(&mut self, ctx: &egui::Context) {
+    fn tick(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
         self.poll_connection();
         if let Some(snapshot) = self.runtime.take_latest() {
             let now = ctx.input(|input| input.time);
             let discontinuities = self.runtime.stats().discontinuities.load(Ordering::Relaxed);
-            self.update_snapshot(ctx, snapshot, now, discontinuities);
+            self.update_snapshot(&ctx, snapshot, now, discontinuities);
         }
+        self.expire_live_metrics(ctx.input(|input| input.time));
 
-        self.top_bar(ctx);
-        self.connection_bar(ctx);
-        self.status_bar(ctx);
-        self.side_bar(ctx);
-        self.dashboard(ctx);
-        self.routing_window(ctx);
-        self.settings_window(ctx);
-        self.about_window(ctx);
+        self.top_bar(root_ui);
+        self.connection_bar(root_ui);
+        self.status_bar(root_ui);
+        self.side_bar(root_ui);
+        self.dashboard(root_ui);
+        self.routing_window(&ctx);
+        self.settings_window(&ctx);
+        self.about_window(&ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -1255,6 +1277,66 @@ mod tests {
     }
 
     #[test]
+    fn stalled_input_expires_live_metrics_but_preserves_hold_and_history() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut app = AnalyzerApp::with_controller(
+            AnalyzerController::with_source(UnavailableInput).unwrap(),
+        );
+        let level = SignalLevel {
+            peak_dbfs: -6.0,
+            rms_dbfs: -9.0,
+        };
+        app.update_snapshot(
+            &ctx,
+            AnalysisSnapshot {
+                sample_rate: 48_000,
+                has_reference: true,
+                measurement_level: level,
+                reference_level: Some(level),
+                phase_correlation: Some(1.0),
+                ..AnalysisSnapshot::default()
+            },
+            1.0,
+            0,
+        );
+        assert!(app.measurement_signal.active());
+        assert!(app.reference_signal.active());
+        app.display_hold.toggle();
+        let points_before = app.measurement_points.clone();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(2.1),
+                ..Default::default()
+            },
+            |ui| app.tick(ui),
+        );
+        output.textures_delta.clear();
+        assert!(!app.measurement_signal.active());
+        assert!(!app.reference_signal.active());
+        assert_eq!(app.measurement_held_dbfs, -120.0);
+        assert!(app.phase_correlation.is_none());
+        assert!(app.scope_points.is_empty());
+        assert!(app.display_hold.active());
+        assert_eq!(app.measurement_points, points_before);
+        assert_eq!(app.history.points().len(), 1);
+        app.update_snapshot(
+            &ctx,
+            AnalysisSnapshot {
+                sample_rate: 48_000,
+                window_start_frame: 4_800,
+                measurement_level: level,
+                ..AnalysisSnapshot::default()
+            },
+            2.2,
+            0,
+        );
+        assert!(app.measurement_signal.active());
+        assert_eq!(app.measurement_points, points_before);
+        assert_eq!(app.history.points().len(), 2);
+    }
+
+    #[test]
     fn full_app_renders_disconnected_and_failed_at_supported_sizes() {
         for size in [vec2(760.0, 640.0), vec2(1440.0, 900.0)] {
             let ctx = egui::Context::default();
@@ -1263,14 +1345,15 @@ mod tests {
                 AnalyzerController::with_source(UnavailableInput).unwrap(),
             );
             let draw = |app: &mut AnalyzerApp| {
-                let output = ctx.run(
+                let mut output = ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                         ..Default::default()
                     },
-                    |ctx| app.tick(ctx),
+                    |ui| app.tick(ui),
                 );
                 assert!(!output.shapes.is_empty());
+                output.textures_delta.clear();
             };
             draw(&mut app);
             app.runtime.start().unwrap();

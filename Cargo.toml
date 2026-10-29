@@ -2,6 +2,7 @@
 name = "audio_analyzer"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 
 [features]
 default = ["desktop", "asio"]
@@ -20,16 +21,19 @@ required-features = ["audio-device"]
 
 [dependencies]
 # オーディオI/O。WindowsのWASAPIおよびASIOをサポート
-cpal = { version = "0.18.1", optional = true }
+cpal = { version = "0.18.2", optional = true }
 
 # 高速フーリエ変換
 rustfft = "6.4.1"
 
 # ロックフリー・リングバッファ
-ringbuf = "0.5.0"
+ringbuf = "0.5.3"
 
 # Immediate Mode GUIフレームワーク
-eframe = { version = "0.30.0", optional = true }
+# Keep the existing OpenGL renderer; eframe 0.37 defaults to WGPU.
+eframe = { version = "0.37.0", optional = true, default-features = false, features = [
+    "accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "web_screen_reader", "x11",
+] }
 
 # egui用のプロットライブラリ
-egui_plot = { version = "0.30.0", optional = true }
+egui_plot = { version = "0.38.0", optional = true }

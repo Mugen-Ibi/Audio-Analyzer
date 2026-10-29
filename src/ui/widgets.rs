@@ -24,22 +24,22 @@ pub fn module(
     body: impl FnOnce(&mut Ui),
 ) {
     let stroke = Stroke::new(1.0, if accent { CYAN } else { OUTLINE });
-    Frame::none()
+    Frame::NONE
         .fill(SURFACE)
         .stroke(stroke)
-        .rounding(12.0)
-        .inner_margin(egui::Margin::same(0.0))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(0))
         .show(ui, |ui| {
             ui.set_min_height(min_height);
-            Frame::none()
+            Frame::NONE
                 .fill(SURFACE_LOW)
-                .rounding(egui::Rounding {
-                    nw: 12.0,
-                    ne: 12.0,
-                    sw: 0.0,
-                    se: 0.0,
+                .corner_radius(egui::CornerRadius {
+                    nw: 12,
+                    ne: 12,
+                    sw: 0,
+                    se: 0,
                 })
-                .inner_margin(egui::Margin::symmetric(16.0, 11.0))
+                .inner_margin(egui::Margin::symmetric(16, 11))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -51,8 +51,8 @@ pub fn module(
                     });
                 });
             ui.separator();
-            Frame::none()
-                .inner_margin(egui::Margin::same(16.0))
+            Frame::NONE
+                .inner_margin(egui::Margin::same(16))
                 .show(ui, body);
         });
 }
@@ -68,7 +68,7 @@ pub fn chip(ui: &mut Ui, label: &str, active: bool) -> Response {
             BACKGROUND
         })
         .stroke(Stroke::new(1.0, if active { CYAN } else { OUTLINE }))
-        .rounding(7.0);
+        .corner_radius(7.0);
     ui.add(button)
 }
 
@@ -80,11 +80,11 @@ pub fn summary_metric(
     detail: &str,
     color: Color32,
 ) {
-    Frame::none()
+    Frame::NONE
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, OUTLINE))
-        .rounding(12.0)
-        .inner_margin(egui::Margin::same(16.0))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(16))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.set_min_height(78.0);
@@ -119,7 +119,7 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, selected: bool, enabled: 
         Color32::TRANSPARENT
     })
     .stroke(Stroke::NONE)
-    .rounding(7.0);
+    .corner_radius(7.0);
     ui.add_enabled_ui(enabled, |ui| {
         ui.add_sized(vec2(ui.available_width() - 16.0, 44.0), button)
     })
@@ -136,8 +136,12 @@ pub fn level_meter(ui: &mut Ui, current_dbfs: f32, held_dbfs: f32, label: &str, 
         pos2(rect.right() - 13.0, rect.bottom() - 22.0),
     );
     ui.painter().rect_filled(meter, 0.0, SURFACE_HIGH);
-    ui.painter()
-        .rect_stroke(meter, 0.0, Stroke::new(1.0, OUTLINE));
+    ui.painter().rect_stroke(
+        meter,
+        0.0,
+        Stroke::new(1.0, OUTLINE),
+        egui::StrokeKind::Inside,
+    );
 
     let normalized = db_normalized(current_dbfs);
     let segments = 24;
@@ -317,7 +321,7 @@ pub fn spectrogram_image(
     width: usize,
     viewport: HistoryViewport,
 ) -> ColorImage {
-    let mut image = ColorImage::new([width, HISTORY_SPECTRUM_BANDS], BACKGROUND);
+    let mut image = ColorImage::filled([width, HISTORY_SPECTRUM_BANDS], BACKGROUND);
     if width == 0 {
         return image;
     }
@@ -609,13 +613,13 @@ mod tests {
         for width in [760.0, 1440.0] {
             let ctx = egui::Context::default();
             theme::install(&ctx);
-            let output = ctx.run(
+            let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 900.0))),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         summary_metric(ui, "測定", None, "dBFS", "Peak N/A", CYAN);
                         level_meter(ui, -120.0, -120.0, "測定", CYAN);
                         history_plot(ui, &VecDeque::new(), 100.0);
@@ -625,6 +629,7 @@ mod tests {
                 },
             );
             assert!(!output.shapes.is_empty());
+            output.textures_delta.clear();
         }
     }
 }

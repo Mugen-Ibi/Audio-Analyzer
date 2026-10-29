@@ -88,8 +88,8 @@ rustup update
 ### Step 3: クローンとビルドテスト
 
 ```
-git clone https://github.com/owata2022/rust-audio-analyzer.git
-cd rust-audio-analyzer
+git clone https://github.com/Mugen-Ibi/Audio-Analyzer.git
+cd Audio-Analyzer
 # asioフィーチャーが有効になっているため、そのままビルド可能です
 cargo build
 cargo run

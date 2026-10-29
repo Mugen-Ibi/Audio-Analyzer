@@ -41,7 +41,7 @@ WASAPIフォールバックはCPALの共有モードを使用します。WASAPI 
 
 ## ビルド
 
-Rust Edition 2024を使用します。WindowsでASIOを有効にしているため、Visual Studio C++ Build ToolsとLLVM/Clangが必要です。
+Rust 1.95以降（Edition 2024）を使用します。WindowsでASIOを有効にしているため、Visual Studio C++ Build ToolsとLLVM/Clangが必要です。
 
 ```powershell
 cargo run --release
@@ -54,6 +54,8 @@ Test-Path "$env:TEMP\asio_sdk\host\asiodrivers.h"
 Rename-Item "$env:TEMP\asio_sdk" "asio_sdk.invalid"
 cargo build --release --locked
 ```
+
+GUIは `eframe 0.37` / `egui_plot 0.38` を使用し、従来のOpenGL (`glow`) レンダラーを明示的に維持しています。
 
 `asio_sdk.invalid` がすでに存在する場合は、別の退避名を指定してください。LLVMを標準以外の場所へインストールした場合は、あわせて `LIBCLANG_PATH` をLLVMの `bin` ディレクトリへ設定します。
 
@@ -89,6 +91,8 @@ cargo test --locked --test live_audio -- --ignored --nocapture
 このテストは制御スレッドでの接続、入力受信、Reference無効化・復元、停止・再接続、終了処理を確認します。通常のテストとCIでは実行しません。デバイスが利用できなければ失敗し、バックエンド別の理由を表示します。
 
 再設計の検証結果とASIO SDKの環境設定は [ARCHITECTURE.md](ARCHITECTURE.md)、以前のレビュー記録は [REVIEW_PLAN.md](REVIEW_PLAN.md) を参照してください。
+
+最新の依存更新・回帰試験・未検証事項は [MAINTENANCE.md](MAINTENANCE.md) を参照してください。
 
 ## 今後の機能拡張・実機検証
 
